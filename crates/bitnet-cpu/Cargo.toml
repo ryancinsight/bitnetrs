@@ -1,0 +1,15 @@
+[package]
+name    = "bitnet-cpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CPU backend for BitNet b1.58 inference using Rayon parallelism"
+
+[dependencies]
+bitnet-core.workspace = true
+anyhow.workspace      = true
+thiserror.workspace   = true
+tracing.workspace     = true
+rayon.workspace       = true
+bytemuck.workspace    = true

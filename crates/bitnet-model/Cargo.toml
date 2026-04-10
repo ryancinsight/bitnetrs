@@ -1,0 +1,19 @@
+[package]
+name        = "bitnet-model"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "BitNet b1.58 transformer model architecture and forward pass"
+
+[dependencies]
+bitnet-core.workspace    = true
+bitnet-cpu.workspace     = true
+bitnet-gpu.workspace     = true
+bitnet-npu.workspace     = true
+bitnet-weights.workspace = true
+anyhow.workspace         = true
+tracing.workspace        = true
+
+[dev-dependencies]
+bitnet-convert.workspace = true

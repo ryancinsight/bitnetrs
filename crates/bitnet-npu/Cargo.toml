@@ -1,0 +1,16 @@
+[package]
+name        = "bitnet-npu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NPU backend for BitNet b1.58 inference (Windows DirectML via wgpu; CPU fallback)"
+
+[dependencies]
+bitnet-core.workspace = true
+bitnet-cpu.workspace  = true
+bitnet-gpu.workspace  = true
+anyhow.workspace      = true
+tracing.workspace     = true
+wgpu.workspace        = true
+pollster.workspace    = true

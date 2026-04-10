@@ -1,0 +1,15 @@
+[package]
+name    = "bitnet-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types, quantization mathematics, and backend abstractions for BitNet b1.58 inference"
+
+[dependencies]
+anyhow.workspace    = true
+thiserror.workspace = true
+tracing.workspace   = true
+bytemuck.workspace  = true
+serde.workspace     = true
+half.workspace      = true

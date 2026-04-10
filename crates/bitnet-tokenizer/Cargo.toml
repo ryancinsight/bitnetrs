@@ -1,0 +1,18 @@
+[package]
+name        = "bitnet-tokenizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "LLaMA 3 BPE tokenizer for BitNet b1.58 inference"
+
+[dependencies]
+anyhow.workspace    = true
+thiserror.workspace = true
+tracing.workspace   = true
+serde.workspace     = true
+
+# HuggingFace tokenizers: loads tokenizer.json from the model repository.
+# The `onig` feature is required for the Oniguruma-backed regex pre-tokeniser
+# used by the LLaMA 3 BPE splitting pattern.
+tokenizers.workspace = true

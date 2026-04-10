@@ -1,0 +1,20 @@
+[package]
+name        = "bitnet-inference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Inference engine with KV cache, sampling, and chat pipeline for BitNet b1.58"
+
+[dependencies]
+bitnet-core.workspace      = true
+bitnet-model.workspace     = true
+bitnet-weights.workspace   = true
+bitnet-convert.workspace   = true
+bitnet-tokenizer.workspace = true
+anyhow.workspace           = true
+tracing.workspace          = true
+tokio.workspace            = true
+futures.workspace          = true
+serde_json.workspace       = true
+reqwest.workspace          = true

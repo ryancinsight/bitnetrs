@@ -1,0 +1,27 @@
+[package]
+name        = "bitnet-convert"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "BitNet conversion pipeline from HuggingFace packed safetensors to canonical and runtime-ready Rust formats"
+
+[dependencies]
+bitnet-core.workspace    = true
+bitnet-weights.workspace = true
+
+anyhow.workspace    = true
+thiserror.workspace = true
+tracing.workspace   = true
+
+serde.workspace      = true
+serde_json.workspace = true
+
+half.workspace     = true
+bytemuck.workspace = true
+
+rayon.workspace = true
+rkyv.workspace  = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,92 @@
+[workspace]
+members = [
+    "crates/bitnet-core",
+    "crates/bitnet-cpu",
+    "crates/bitnet-gpu",
+    "crates/bitnet-npu",
+    "crates/bitnet-weights",
+    "crates/bitnet-convert",
+    "crates/bitnet-tokenizer",
+    "crates/bitnet-model",
+    "crates/bitnet-inference",
+    "crates/bitnet-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Ryan Clanton <ryanclanton@outlook.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+# Error handling
+anyhow     = "1"
+thiserror  = "2"
+
+# Observability
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Numeric / memory
+bytemuck = { version = "1", features = ["derive"] }
+half     = { version = "2", features = ["bytemuck"] }
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+rkyv       = { version = "0.7", features = ["validation"] }
+
+# Parallelism & async
+rayon   = "1"
+tokio   = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# GPU
+wgpu     = "23"
+pollster = "0.3"
+
+# Networking / model hub
+reqwest    = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+indicatif  = "0.17"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Model weights
+safetensors = "0.4"
+
+# Tokenization
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# HuggingFace Hub client
+hf-hub = { version = "0.3", features = ["tokio"] }
+
+# Hashing
+sha2 = "0.10"
+
+# Testing
+tempfile = "3"
+
+# Internal crates
+bitnet-core      = { path = "crates/bitnet-core" }
+bitnet-cpu       = { path = "crates/bitnet-cpu" }
+bitnet-gpu       = { path = "crates/bitnet-gpu" }
+bitnet-npu       = { path = "crates/bitnet-npu" }
+bitnet-weights   = { path = "crates/bitnet-weights" }
+bitnet-tokenizer = { path = "crates/bitnet-tokenizer" }
+bitnet-model     = { path = "crates/bitnet-model" }
+bitnet-inference = { path = "crates/bitnet-inference" }
+bitnet-convert   = { path = "crates/bitnet-convert" }
+bitnet-cli       = { path = "crates/bitnet-cli" }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
+[profile.dev]
+opt-level     = 1      # enough optimisation to keep tensor ops fast during dev
+incremental   = false  # prevent windows-gnu nightly COMDAT symbol corruption
+codegen-units = 1      # single CGU eliminates cross-unit weak-symbol drops on MinGW ld
