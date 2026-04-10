@@ -19,7 +19,7 @@
 //! prefill:  model.forward(prompt_tokens, 0, &mut kv_cache)
 //! decode:   loop {
 //!               logits = model.forward(&[last_token], kv_cache.filled_positions, &mut kv_cache)
-//!               next   = sample_next_token(&logits, &config, &generated_so_far)
+//!               next   = sample_next_token(&mut logits, &config, &generated_so_far, &mut buffers)
 //!               if next == EOS { break }
 //!               generated.push(next)
 //!           }
@@ -175,6 +175,37 @@ impl Default for SamplingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// SamplingBuffers
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated scratch buffers for token sampling.
+///
+/// Eliminates ~2-3 MiB of heap allocation per generated token by reusing
+/// vocab-sized buffers across sampling calls.
+pub struct SamplingBuffers {
+    /// Scratch for sorted logits (top-k filtering).
+    sorted: Vec<f32>,
+    /// Scratch for exponentiated logits.
+    exps: Vec<f32>,
+    /// Scratch for probability distribution.
+    probs: Vec<f32>,
+    /// Scratch for sorted indices (top-p filtering).
+    indices: Vec<usize>,
+}
+
+impl SamplingBuffers {
+    /// Allocate sampling buffers for the given vocabulary size.
+    pub fn new(vocab_size: usize) -> Self {
+        Self {
+            sorted: vec![0.0; vocab_size],
+            exps: vec![0.0; vocab_size],
+            probs: vec![0.0; vocab_size],
+            indices: (0..vocab_size).collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sample_next_token
 // ---------------------------------------------------------------------------
 
@@ -191,9 +222,10 @@ impl Default for SamplingConfig {
 ///
 /// # Arguments
 ///
-/// - `logits`:       Mutable logit vector (modified in-place during processing).
+/// - `logits`:       Mutable logit slice (modified in-place during processing).
 /// - `config`:       Sampling hyperparameters.
 /// - `past_tokens`:  All tokens generated so far (used for repetition penalty).
+/// - `buffers`:      Pre-allocated scratch buffers (see [`SamplingBuffers`]).
 ///
 /// # Returns
 ///
@@ -202,9 +234,10 @@ impl Default for SamplingConfig {
 /// # Panics (debug only)
 /// Panics if `logits` is empty.
 pub fn sample_next_token(
-    logits: &mut Vec<f32>,
+    logits: &mut [f32],
     config: &SamplingConfig,
     past_tokens: &[u32],
+    buffers: &mut SamplingBuffers,
 ) -> u32 {
     debug_assert!(!logits.is_empty(), "logits must not be empty");
 
@@ -239,10 +272,15 @@ pub fn sample_next_token(
 
     // ── 4. Top-k filtering ────────────────────────────────────────────────
     if config.top_k > 0 && config.top_k < vocab {
-        // Find the k-th largest value.
-        let mut sorted: Vec<f32> = logits.iter().cloned().collect();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted[config.top_k.min(sorted.len()) - 1];
+        // Copy logits into scratch, then use partial sort to find the k-th largest.
+        buffers.sorted[..vocab].copy_from_slice(logits);
+        let k = config.top_k.min(vocab);
+        // select_nth_unstable_by partitions so that element at index k-1 is
+        // the k-th largest when sorting descending.
+        buffers.sorted[..vocab].select_nth_unstable_by(k - 1, |a, b| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let threshold = buffers.sorted[k - 1];
         for v in logits.iter_mut() {
             if *v < threshold {
                 *v = f32::NEG_INFINITY;
@@ -252,38 +290,45 @@ pub fn sample_next_token(
 
     // ── 5. Top-p (nucleus) filtering ──────────────────────────────────────
     if config.top_p < 1.0 {
-        // Compute softmax probabilities for sorting.
+        // Compute softmax probabilities using pre-allocated buffers.
         let max_logit = logits
             .iter()
             .filter(|v| v.is_finite())
             .cloned()
             .fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = logits
-            .iter()
-            .map(|&v| {
-                if v.is_finite() {
-                    (v - max_logit).exp()
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let sum_exp: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        let mut sum_exp = 0.0_f32;
+        for i in 0..vocab {
+            let e = if logits[i].is_finite() {
+                (logits[i] - max_logit).exp()
+            } else {
+                0.0
+            };
+            buffers.exps[i] = e;
+            sum_exp += e;
+        }
+
+        let inv_sum = if sum_exp > 0.0 { sum_exp.recip() } else { 1.0 };
+        for i in 0..vocab {
+            buffers.probs[i] = buffers.exps[i] * inv_sum;
+        }
 
         // Sort indices by probability descending.
-        let mut indices: Vec<usize> = (0..vocab).collect();
-        indices.sort_by(|&a, &b| {
-            probs[b]
-                .partial_cmp(&probs[a])
+        // Reset indices to 0..vocab (may be stale from a previous call).
+        for i in 0..vocab {
+            buffers.indices[i] = i;
+        }
+        buffers.indices[..vocab].sort_unstable_by(|&a, &b| {
+            buffers.probs[b]
+                .partial_cmp(&buffers.probs[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Keep the smallest prefix with cumulative prob >= top_p.
         let mut cum_prob = 0.0_f32;
         let mut cutoff_idx = vocab;
-        for (rank, &idx) in indices.iter().enumerate() {
-            cum_prob += probs[idx];
+        for (rank, &idx) in buffers.indices[..vocab].iter().enumerate() {
+            cum_prob += buffers.probs[idx];
             if cum_prob >= config.top_p {
                 cutoff_idx = rank + 1;
                 break;
@@ -291,38 +336,42 @@ pub fn sample_next_token(
         }
 
         // Mask out tokens beyond the nucleus.
-        let keep_set: std::collections::HashSet<usize> =
-            indices[..cutoff_idx].iter().cloned().collect();
-        for (i, v) in logits.iter_mut().enumerate() {
-            if !keep_set.contains(&i) {
-                *v = f32::NEG_INFINITY;
+        // Repurpose exps buffer as a boolean flag array (0.0 = excluded, 1.0 = included)
+        // to avoid HashSet allocation.
+        for i in 0..vocab {
+            buffers.exps[i] = 0.0;
+        }
+        for &idx in &buffers.indices[..cutoff_idx] {
+            buffers.exps[idx] = 1.0;
+        }
+        for i in 0..vocab {
+            if buffers.exps[i] == 0.0 {
+                logits[i] = f32::NEG_INFINITY;
             }
         }
     }
 
     // ── 6. Softmax → categorical sample ──────────────────────────────────
-    // Compute stable softmax over the remaining logits.
     let max_logit = logits
         .iter()
         .filter(|v| v.is_finite())
         .cloned()
         .fold(f32::NEG_INFINITY, f32::max);
 
-    let mut probs: Vec<f32> = logits
-        .iter()
-        .map(|&v| {
-            if v.is_finite() {
-                (v - max_logit).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let mut sum = 0.0_f32;
+    for i in 0..vocab {
+        let p = if logits[i].is_finite() {
+            (logits[i] - max_logit).exp()
+        } else {
+            0.0
+        };
+        buffers.probs[i] = p;
+        sum += p;
+    }
 
-    let sum: f32 = probs.iter().sum();
     let inv_sum = if sum > 0.0 { sum.recip() } else { 1.0 };
-    for p in probs.iter_mut() {
-        *p *= inv_sum;
+    for i in 0..vocab {
+        buffers.probs[i] *= inv_sum;
     }
 
     // Simple LCG PRNG for reproducible sampling.
@@ -332,22 +381,21 @@ pub fn sample_next_token(
     rng_state = rng_state
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
-    let rand_u64 = rng_state;
 
     // Convert to uniform [0, 1).
-    let rand_f: f32 = (rand_u64 >> 11) as f32 / (1u64 << 53) as f32;
+    let rand_f: f32 = (rng_state >> 11) as f32 / (1u64 << 53) as f32;
 
     // Inverse CDF sampling.
     let mut cumulative = 0.0_f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cumulative += p;
+    for i in 0..vocab {
+        cumulative += buffers.probs[i];
         if rand_f <= cumulative {
             return i as u32;
         }
     }
 
     // Fallback: return the argmax (should rarely happen due to floating point).
-    probs
+    buffers.probs[..vocab]
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -450,6 +498,8 @@ pub struct InferenceEngine {
     tokenizer: Tokenizer,
     /// KV cache (max context window).
     kv_cache: KVCache,
+    /// Pre-allocated scratch buffers for token sampling.
+    sampling_buffers: SamplingBuffers,
 }
 
 impl std::fmt::Debug for InferenceEngine {
@@ -541,12 +591,15 @@ impl InferenceEngine {
              or set BITNET_TOKENIZER=/path/to/tokenizer.json.",
         )?;
 
+        let sampling_buffers = SamplingBuffers::new(config.vocab_size);
+
         info!(backend = %model.backend_name(), "InferenceEngine ready");
 
         Ok(Self {
             model,
             tokenizer,
             kv_cache,
+            sampling_buffers,
         })
     }
 
@@ -608,7 +661,12 @@ impl InferenceEngine {
 
         for step in 0..sampling.max_new_tokens {
             // Sample next token from the accumulated context.
-            let next_token = sample_next_token(&mut logits, sampling, &all_tokens);
+            let next_token = sample_next_token(
+                &mut logits,
+                sampling,
+                &all_tokens,
+                &mut self.sampling_buffers,
+            );
 
             if next_token == eos_eot || next_token == eos_eot_text {
                 debug!(
@@ -630,7 +688,10 @@ impl InferenceEngine {
                 .with_context(|| format!("Decode forward pass failed at step {step}"))?;
         }
 
-        debug!(n_generated = all_tokens.len() - prompt_len, "Generation complete");
+        debug!(
+            n_generated = all_tokens.len() - prompt_len,
+            "Generation complete"
+        );
 
         // Decode only the generated tokens (after the prompt) to text.
         self.tokenizer
@@ -926,24 +987,27 @@ mod tests {
     fn sample_greedy_picks_argmax() {
         // With top_k=1, must return the argmax regardless of other settings.
         let mut logits = vec![0.1_f32, 0.5, 5.0, 0.2, -1.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig::greedy(); // top_k=1
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert_eq!(token, 2u32, "greedy must pick index 2 (logit=5.0)");
     }
 
     #[test]
     fn sample_greedy_picks_last_element_if_max() {
         let mut logits = vec![0.0_f32, 0.0, 0.0, 0.0, 10.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig::greedy();
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert_eq!(token, 4u32, "greedy must pick the last (max) element");
     }
 
     #[test]
     fn sample_greedy_picks_first_element_if_max() {
         let mut logits = vec![100.0_f32, 0.0, -1.0, -5.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig::greedy();
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert_eq!(token, 0u32, "greedy must pick index 0 (max logit)");
     }
 
@@ -952,6 +1016,7 @@ mod tests {
         // Property: the sampled token must always be a valid vocab index.
         let vocab_size = 32;
         let mut logits: Vec<f32> = (0..vocab_size).map(|i| i as f32 * 0.1).collect();
+        let mut buffers = SamplingBuffers::new(vocab_size);
         let cfg = SamplingConfig {
             temperature: 0.8,
             top_p: 0.9,
@@ -960,7 +1025,7 @@ mod tests {
             max_new_tokens: 1,
             seed: 42,
         };
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert!(
             (token as usize) < vocab_size,
             "sampled token {token} must be < vocab_size {vocab_size}"
@@ -973,6 +1038,7 @@ mod tests {
         let vocab_size = 4;
         // Token 2 has the highest logit, but we penalise it.
         let mut logits = vec![0.0_f32, 0.0, 10.0, 0.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig {
             temperature: 1.0,
             top_p: 1.0,
@@ -986,7 +1052,7 @@ mod tests {
         // After extreme penalty: logits[2] = 10.0 / 1000.0 = 0.01
         // One of the other tokens (0.0 logit) should now be more likely.
         // The test verifies we don't always return 2.
-        let token = sample_next_token(&mut logits, &cfg, &past);
+        let token = sample_next_token(&mut logits, &cfg, &past, &mut buffers);
         // After penalty, logit[2] = 0.01, so the distribution is nearly uniform.
         // The sampled token could be anything — just verify it's in range.
         assert!(
@@ -1006,11 +1072,12 @@ mod tests {
             seed: 12345,
         };
         let logits_orig: Vec<f32> = (0..128).map(|i| (i as f32 * 0.17).sin()).collect();
+        let mut buffers = SamplingBuffers::new(logits_orig.len());
 
         let mut l1 = logits_orig.clone();
         let mut l2 = logits_orig.clone();
-        let t1 = sample_next_token(&mut l1, &cfg, &[]);
-        let t2 = sample_next_token(&mut l2, &cfg, &[]);
+        let t1 = sample_next_token(&mut l1, &cfg, &[], &mut buffers);
+        let t2 = sample_next_token(&mut l2, &cfg, &[], &mut buffers);
 
         assert_eq!(
             t1, t2,
@@ -1023,6 +1090,7 @@ mod tests {
         // With a diverse distribution and different seeds, we may get different tokens.
         // This is a probabilistic test — we verify it doesn't panic.
         let logits_orig: Vec<f32> = (0..128).map(|i| (i as f32 * 0.1).sin()).collect();
+        let mut buffers = SamplingBuffers::new(logits_orig.len());
         let mut seen = std::collections::HashSet::new();
 
         for seed in 0..20_u64 {
@@ -1035,7 +1103,7 @@ mod tests {
                 seed,
             };
             let mut l = logits_orig.clone();
-            let tok = sample_next_token(&mut l, &cfg, &[]);
+            let tok = sample_next_token(&mut l, &cfg, &[], &mut buffers);
             seen.insert(tok);
         }
         // Over 20 different seeds, we should see at least 2 distinct tokens
@@ -1052,6 +1120,7 @@ mod tests {
         // If only one token has a finite logit, it must always be selected.
         let mut logits = vec![f32::NEG_INFINITY; 8];
         logits[5] = 1.0;
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig {
             temperature: 1.0,
             top_p: 1.0,
@@ -1060,7 +1129,7 @@ mod tests {
             max_new_tokens: 1,
             seed: 0,
         };
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         // With only one non-neg-infinity token, the sampling must pick index 5.
         // (The fallback argmax also picks 5 since 1.0 > NEG_INFINITY.)
         assert_eq!(token, 5u32, "must pick the only finite token");
@@ -1070,6 +1139,7 @@ mod tests {
     fn sample_top_k_restricts_to_k_highest() {
         // With top_k=1 and a clear winner, must always pick the winner.
         let mut logits = vec![1.0_f32, 5.0, 0.0, -1.0, 2.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig {
             temperature: 1.0,
             top_p: 1.0,
@@ -1078,7 +1148,7 @@ mod tests {
             max_new_tokens: 1,
             seed: 0,
         };
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert_eq!(
             token, 1u32,
             "top_k=1 must always return the highest-logit token"
@@ -1089,6 +1159,7 @@ mod tests {
     fn sample_temperature_near_zero_approaches_greedy() {
         // Very low temperature → logits amplified → the max dominates.
         let mut logits = vec![0.0_f32, 1.0, 10.0, 2.0];
+        let mut buffers = SamplingBuffers::new(logits.len());
         let cfg = SamplingConfig {
             temperature: 0.01,
             top_p: 1.0,
@@ -1097,7 +1168,7 @@ mod tests {
             max_new_tokens: 1,
             seed: 0,
         };
-        let token = sample_next_token(&mut logits, &cfg, &[]);
+        let token = sample_next_token(&mut logits, &cfg, &[], &mut buffers);
         assert_eq!(
             token, 2u32,
             "very low temperature must select the max-logit token"
@@ -1147,6 +1218,7 @@ mod tests {
     #[test]
     fn sample_stress_test_no_panic() {
         let vocab_size = 1024;
+        let mut buffers = SamplingBuffers::new(vocab_size);
         let cfg = SamplingConfig {
             temperature: 0.7,
             top_p: 0.9,
@@ -1167,7 +1239,7 @@ mod tests {
             let mut step_cfg = cfg.clone();
             step_cfg.seed = 42 + step;
 
-            let tok = sample_next_token(&mut logits, &step_cfg, &generated);
+            let tok = sample_next_token(&mut logits, &step_cfg, &generated, &mut buffers);
             assert!(
                 (tok as usize) < vocab_size,
                 "step {step}: token {tok} out of range"
@@ -1780,6 +1852,7 @@ mod tests {
         // With top_k=3, the sampled token must be one of the 3 highest-logit tokens.
         let logits = vec![1.0_f32, 5.0, 3.0, 2.0, 4.0, 0.5]; // indices sorted: 1>4>2>3>0>5
         let top3_indices: std::collections::HashSet<u32> = [1, 4, 2].iter().cloned().collect();
+        let mut buffers = SamplingBuffers::new(logits.len());
 
         // Run multiple seeds to get varied samples.
         for seed in 0..50_u64 {
@@ -1792,7 +1865,7 @@ mod tests {
                 seed,
             };
             let mut l = logits.clone();
-            let token = sample_next_token(&mut l, &cfg, &[]);
+            let token = sample_next_token(&mut l, &cfg, &[], &mut buffers);
             assert!(
                 top3_indices.contains(&token),
                 "seed={seed}: token {token} not in top-3 set {:?}",

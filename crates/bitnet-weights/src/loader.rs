@@ -591,7 +591,7 @@ pub fn load_weights_from_packed(
             1.0_f32
         };
 
-        TernaryWeight::new(ternary_data, scale, rows, cols)
+        TernaryWeight::from_i8(&ternary_data, scale, rows, cols)
             .with_context(|| format!("TernaryWeight construction failed for '{key}'"))
     };
 
@@ -921,8 +921,8 @@ fn quantise_weight(
         "absmean_quantize returned non-positive scale for '{key}': {scale}"
     );
 
-    TernaryWeight::new(quantised_data, scale, rows, cols)
-        .with_context(|| format!("TernaryWeight::new failed for '{key}'"))
+    TernaryWeight::from_i8(&quantised_data, scale, rows, cols)
+        .with_context(|| format!("TernaryWeight::from_i8 failed for '{key}'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +931,15 @@ fn quantise_weight(
 
 #[cfg(test)]
 mod tests {
+    /// Unpack all logical i8 values from a `TernaryWeight` (row-aligned).
+    fn unpack_all(tw: &bitnet_core::quant::ternary::TernaryWeight) -> Vec<i8> {
+        let mut all = Vec::with_capacity(tw.numel());
+        for r in 0..tw.rows {
+            all.extend_from_slice(&tw.row_unpacked(r));
+        }
+        all
+    }
+
     use super::*;
     use bitnet_core::config::bitnet_2b_config;
     use std::io::Write;
@@ -1149,9 +1158,10 @@ mod tests {
         let tw = quantise_weight(&map, "w", 2, 3).unwrap();
         assert_eq!(tw.rows, 2);
         assert_eq!(tw.cols, 3);
-        assert_eq!(tw.data.len(), 6);
+        assert_eq!(tw.numel(), 6);
         // All values must be ternary.
-        for &v in &tw.data {
+        let unpacked = unpack_all(&tw);
+        for &v in &unpacked {
             assert!(v == -1 || v == 0 || v == 1, "not ternary: {v}");
         }
         // Scale must be positive.
@@ -1164,7 +1174,8 @@ mod tests {
         map.insert("z".to_string(), vec![0.0_f32; 4]); // 2×2 all-zero
         let tw = quantise_weight(&map, "z", 2, 2).unwrap();
         // absmean clamps to 1e-5 minimum, quantised values should all be 0.
-        assert!(tw.data.iter().all(|&v| v == 0));
+        let unpacked = unpack_all(&tw);
+        assert!(unpacked.iter().all(|&v| v == 0));
         assert!(tw.scale > 0.0);
     }
 
@@ -1261,7 +1272,8 @@ mod tests {
                 ("up_proj", &layer.up_proj),
                 ("down_proj", &layer.down_proj),
             ] {
-                for &v in &tw.data {
+                let unpacked = unpack_all(tw);
+                for &v in &unpacked {
                     assert!(
                         v == -1 || v == 0 || v == 1,
                         "layer {layer_idx}.{name}: ternary invariant violated: {v}"
@@ -1425,8 +1437,10 @@ mod tests {
         for (layer_idx, layer) in weights.layers.iter().enumerate() {
             // Check q_proj as a representative projection weight.
             let tw = &layer.q_proj;
-            // Reconstruct approximate weights: w_approx[i] = tw.data[i] * tw.scale
-            for (i, &q_val) in tw.data.iter().enumerate() {
+            // Unpack packed u8 data to i8 ternary values for inspection.
+            let unpacked = unpack_all(tw);
+            // Reconstruct approximate weights: w_approx[i] = unpacked[i] * tw.scale
+            for (i, &q_val) in unpacked.iter().enumerate() {
                 let w_approx = q_val as f32 * tw.scale;
                 // w_approx ∈ {-tw.scale, 0, +tw.scale}
                 let abs_approx = w_approx.abs();
@@ -1767,7 +1781,8 @@ mod tests {
         );
 
         // ── Non-zero weight ratio ────────────────────────────────────────────
-        let q_data = &weights.layers[0].q_proj.data;
+        let q_proj_ref = &weights.layers[0].q_proj;
+        let q_data = unpack_all(q_proj_ref);
         let n_nonzero = q_data.iter().filter(|&&v| v != 0).count();
         let nonzero_frac = n_nonzero as f32 / q_data.len() as f32;
         eprintln!(
@@ -1920,8 +1935,9 @@ mod tests {
             "q_proj scale must be finite and positive, got {}",
             q_proj.scale
         );
+        let q_unpacked = unpack_all(q_proj);
         assert!(
-            q_proj.data.iter().all(|&v| matches!(v, -1 | 0 | 1)),
+            q_unpacked.iter().all(|&v| matches!(v, -1 | 0 | 1)),
             "decoded q_proj ternary data must stay within {{-1, 0, +1}}"
         );
     }

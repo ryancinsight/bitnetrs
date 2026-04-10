@@ -293,23 +293,50 @@ pub fn lm_head_matmul(
     vocab_size: usize,
     hidden_size: usize,
 ) -> Vec<f32> {
+    let mut logits = vec![0.0_f32; vocab_size];
+    lm_head_matmul_into(hidden, weights, &mut logits, vocab_size, hidden_size);
+    logits
+}
+
+/// LM head matrix-vector product, writing into a pre-allocated output buffer.
+///
+/// ```text
+/// output[v] = Σ_h  weights[v * hidden_size + h] * hidden[h]
+/// ```
+///
+/// Identical to [`lm_head_matmul`] but avoids allocating the output vector on
+/// every call.  The inner loop is auto-vectorisable; Rayon parallelises across
+/// vocabulary rows.
+///
+/// # Arguments
+/// - `hidden`:      `[hidden_size]` — the final normalised hidden state.
+/// - `weights`:     `[vocab_size × hidden_size]` row-major.
+/// - `output`:      `[vocab_size]` — pre-allocated buffer, overwritten entirely.
+/// - `vocab_size`:  number of vocabulary entries.
+/// - `hidden_size`: embedding / model dimension.
+///
+/// # Panics (debug only)
+/// Panics if any slice length does not match the declared dimensions.
+pub fn lm_head_matmul_into(
+    hidden: &[f32],
+    weights: &[f32],
+    output: &mut [f32],
+    vocab_size: usize,
+    hidden_size: usize,
+) {
     debug_assert_eq!(hidden.len(), hidden_size);
     debug_assert_eq!(weights.len(), vocab_size * hidden_size);
+    debug_assert_eq!(output.len(), vocab_size);
 
-    let mut logits = vec![0.0_f32; vocab_size];
-    logits
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(v, out_elem)| {
-            let row_start = v * hidden_size;
-            let row = &weights[row_start..row_start + hidden_size];
-            let mut acc = 0.0_f32;
-            for h in 0..hidden_size {
-                acc += row[h] * hidden[h];
-            }
-            *out_elem = acc;
-        });
-    logits
+    output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
+        let row_start = v * hidden_size;
+        let row = &weights[row_start..row_start + hidden_size];
+        let mut acc = 0.0_f32;
+        for h in 0..hidden_size {
+            acc += row[h] * hidden[h];
+        }
+        *out_elem = acc;
+    });
 }
 
 // ---------------------------------------------------------------------------

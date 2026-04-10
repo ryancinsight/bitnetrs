@@ -41,13 +41,14 @@
 //!
 //! For a weight matrix of shape `[rows, cols]`:
 //! - Unpacked (`Vec<i8>`) size: `rows * cols` bytes.
-//! - Packed   (`Vec<u8>`) size: `ceil(rows * cols / 4)` bytes.
+//! - Packed   (`Vec<u8>`) size: `ceil(rows * cols / 4)` bytes — a 4× reduction.
 //!
 //! # Invariants
 //!
-//! - Every `i8` element in `data` is in `{-1, 0, 1}`.
-//! - `data.len() == rows * cols`.
+//! - `data.len() == rows * ((cols + 3) / 4)` (row-aligned packed byte count).
 //! - `scale > 0` (guaranteed by clamping in `absmean_quantize`).
+//! - Each 2-bit code in `data` is in `{0b00, 0b01, 0b10}`; `0b11` appears
+//!   only as padding in the last byte when `rows * cols % 4 != 0`.
 
 use crate::error::{BitNetError, Result};
 use serde::{Deserialize, Serialize};
@@ -56,22 +57,31 @@ use serde::{Deserialize, Serialize};
 // TernaryWeight
 // ---------------------------------------------------------------------------
 
-/// A ternary weight matrix: values in {-1, 0, +1} plus a per-tensor f32 scale.
+/// A ternary weight matrix stored in packed 2-bit format.
 ///
-/// The dequantised effective weight at position `(r, c)` is:
+/// Each weight value in {-1, 0, +1} occupies 2 bits, with 4 values packed
+/// per `u8` byte. This reduces memory usage by 4× compared to `Vec<i8>`.
+///
+/// ## Encoding
 ///
 /// ```text
-/// W_eff[r, c] = data[r * cols + c] as f32 * scale
+/// byte = v0 | (v1 << 2) | (v2 << 4) | (v3 << 6)
 /// ```
 ///
-/// # Invariants
-/// - `data[i] ∈ {-1, 0, 1}` for all i.
-/// - `data.len() == rows * cols`.
+/// | value | bits |
+/// |-------|------|
+/// |  +1   |  00  |
+/// |   0   |  01  |
+/// |  -1   |  10  |
+///
+/// ## Invariants
+/// - `data.len() == rows * ((cols + 3) / 4)` (row-aligned packed byte count).
 /// - `scale > 0`.
+/// - Each row starts at a byte boundary (requires `cols % 4 == 0` for aligned access).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TernaryWeight {
-    /// Row-major flat storage; each element ∈ {-1, 0, 1}.
-    pub data: Vec<i8>,
+    /// Packed 2-bit-per-value storage. 4 ternary values per byte.
+    pub data: Vec<u8>,
     /// Per-tensor absmean scale α_W = mean(|W|).
     pub scale: f32,
     /// Number of output features (matrix rows).
@@ -81,13 +91,45 @@ pub struct TernaryWeight {
 }
 
 impl TernaryWeight {
-    /// Construct a [`TernaryWeight`] from validated components.
+    /// Construct a [`TernaryWeight`] from pre-packed row-aligned data.
+    ///
+    /// `packed_data` must have exactly `rows * ((cols + 3) / 4)` bytes,
+    /// where each row is independently packed to a byte boundary.
+    ///
+    /// # Errors
+    /// Returns [`BitNetError::InvalidShape`] if `packed_data.len()` is wrong.
+    /// Returns [`BitNetError::QuantizationError`] if `scale <= 0`.
+    pub fn new(packed_data: Vec<u8>, scale: f32, rows: usize, cols: usize) -> Result<Self> {
+        let packed_cols = (cols + 3) / 4;
+        let expected_bytes = rows * packed_cols;
+        if packed_data.len() != expected_bytes {
+            return Err(BitNetError::shape(
+                format!("packed data: {rows} * (({cols} + 3) / 4) = {expected_bytes} bytes"),
+                format!("{} bytes", packed_data.len()),
+            ));
+        }
+        if scale <= 0.0 || !scale.is_finite() {
+            return Err(BitNetError::quant(format!(
+                "scale must be finite and > 0, got {scale}"
+            )));
+        }
+        Ok(Self {
+            data: packed_data,
+            scale,
+            rows,
+            cols,
+        })
+    }
+
+    /// Construct from unpacked `i8` ternary values by packing them.
+    ///
+    /// Each element in `data` must be in `{-1, 0, 1}`.
     ///
     /// # Errors
     /// Returns [`BitNetError::InvalidShape`] if `data.len() != rows * cols`.
     /// Returns [`BitNetError::QuantizationError`] if `scale <= 0` or any value
     /// is outside `{-1, 0, 1}`.
-    pub fn new(data: Vec<i8>, scale: f32, rows: usize, cols: usize) -> Result<Self> {
+    pub fn from_i8(data: &[i8], scale: f32, rows: usize, cols: usize) -> Result<Self> {
         let expected = rows * cols;
         if data.len() != expected {
             return Err(BitNetError::shape(
@@ -100,7 +142,6 @@ impl TernaryWeight {
                 "scale must be finite and > 0, got {scale}"
             )));
         }
-        // Validate ternary constraint in debug builds only (too slow for release).
         #[cfg(debug_assertions)]
         for (i, &v) in data.iter().enumerate() {
             if v < -1 || v > 1 {
@@ -109,63 +150,89 @@ impl TernaryWeight {
                 )));
             }
         }
+        let packed_cols = (cols + 3) / 4;
+        let mut packed = Vec::with_capacity(rows * packed_cols);
+        for r in 0..rows {
+            let row_start = r * cols;
+            packed.extend_from_slice(&pack_ternary(&data[row_start..row_start + cols]));
+        }
         Ok(Self {
-            data,
+            data: packed,
             scale,
             rows,
             cols,
         })
     }
 
-    /// Construct without validation — caller guarantees all invariants hold.
-    ///
-    /// # Safety
-    /// No memory unsafety, but results will be mathematically incorrect if the
-    /// invariants on `data` are violated.
+    /// Construct without validation — caller guarantees all invariants.
     #[inline]
-    pub fn new_unchecked(data: Vec<i8>, scale: f32, rows: usize, cols: usize) -> Self {
+    pub fn new_unchecked(packed_data: Vec<u8>, scale: f32, rows: usize, cols: usize) -> Self {
         Self {
-            data,
+            data: packed_data,
             scale,
             rows,
             cols,
         }
     }
 
-    /// Total number of elements: `rows * cols`.
+    /// Total number of logical elements: `rows * cols`.
     #[inline]
     pub fn numel(&self) -> usize {
         self.rows * self.cols
     }
 
-    /// Access a single element at `(row, col)` without bounds checking.
+    /// Number of packed bytes per row: `(cols + 3) / 4`.
+    #[inline]
+    pub fn packed_cols(&self) -> usize {
+        (self.cols + 3) / 4
+    }
+
+    /// Access the packed bytes for a single row.
     ///
-    /// # Safety
-    /// UB-free (no raw pointers), but panics in debug mode if out of bounds.
+    /// Returns a slice of `packed_cols()` bytes containing the packed
+    /// ternary values for the given row.
+    #[inline]
+    pub fn packed_row(&self, row: usize) -> &[u8] {
+        debug_assert!(row < self.rows);
+        let pc = self.packed_cols();
+        let start = row * pc;
+        &self.data[start..start + pc]
+    }
+
+    /// Access a single element at `(row, col)` by unpacking on the fly.
+    ///
+    /// This is O(1) but involves bit manipulation. Not intended for hot paths.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> i8 {
         debug_assert!(row < self.rows && col < self.cols);
-        self.data[row * self.cols + col]
+        let pc = self.packed_cols();
+        let byte_idx = row * pc + col / 4;
+        let bit_pos = (col % 4) * 2;
+        let code = (self.data[byte_idx] >> bit_pos) & 0b11;
+        match code {
+            0b00 => 1,
+            0b01 => 0,
+            0b10 => -1,
+            _ => 0, // 0b11: invalid, treat as zero
+        }
     }
 
-    /// Return a row slice (input feature vector for output neuron `row`).
-    #[inline]
-    pub fn row(&self, row: usize) -> &[i8] {
-        let start = row * self.cols;
-        &self.data[start..start + self.cols]
+    /// Unpack and return a row as `Vec<i8>` (for debugging/testing).
+    pub fn row_unpacked(&self, row: usize) -> Vec<i8> {
+        let packed = self.packed_row(row);
+        let n = self.cols;
+        unpack_ternary(packed, n).expect("packed row data is valid")
     }
 
-    /// Pack this weight into 2-bit-per-value storage.
-    ///
-    /// See module documentation for the encoding.
+    /// Return the packed data (already packed — this is a no-op clone).
     pub fn pack(&self) -> Vec<u8> {
-        pack_ternary(&self.data)
+        self.data.clone()
     }
 
     /// Compute the memory footprint of the packed representation in bytes.
     #[inline]
     pub fn packed_bytes(&self) -> usize {
-        (self.numel() + 3) / 4
+        self.rows * self.packed_cols()
     }
 }
 
@@ -267,6 +334,10 @@ pub fn unpack_ternary(packed: &[u8], n: usize) -> Result<Vec<i8>> {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // pack_ternary / unpack_ternary (unchanged helpers)
+    // -----------------------------------------------------------------------
+
     /// Verify the round-trip property: pack(unpack(x)) == x for all ternary x.
     #[test]
     fn pack_unpack_roundtrip_full_bytes() {
@@ -326,38 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn ternary_weight_new_validates_shape() {
-        let data = vec![1i8, 0, -1, 1, 0, -1];
-        let tw = TernaryWeight::new(data.clone(), 0.5, 2, 3).unwrap();
-        assert_eq!(tw.rows, 2);
-        assert_eq!(tw.cols, 3);
-        assert_eq!(tw.numel(), 6);
-        assert_eq!(tw.scale, 0.5);
-    }
-
-    #[test]
-    fn ternary_weight_wrong_size_rejected() {
-        let data = vec![1i8, 0, -1];
-        let err = TernaryWeight::new(data, 0.5, 2, 3).unwrap_err();
-        assert!(matches!(err, BitNetError::InvalidShape { .. }));
-    }
-
-    #[test]
-    fn ternary_weight_nonpositive_scale_rejected() {
-        let data = vec![1i8, 0, -1, 0, 1, -1];
-        let err = TernaryWeight::new(data, 0.0, 2, 3).unwrap_err();
-        assert!(matches!(err, BitNetError::QuantizationError(_)));
-    }
-
-    #[test]
-    fn ternary_weight_row_accessor() {
-        let data: Vec<i8> = vec![1, 0, -1, 0, 1, 1];
-        let tw = TernaryWeight::new(data, 1.0, 2, 3).unwrap();
-        assert_eq!(tw.row(0), &[1i8, 0, -1]);
-        assert_eq!(tw.row(1), &[0i8, 1, 1]);
-    }
-
-    #[test]
     fn all_zero_row_encodes_and_decodes() {
         let data: Vec<i8> = vec![0; 16];
         let packed = pack_ternary(&data);
@@ -404,13 +443,129 @@ mod tests {
         assert!(matches!(err, BitNetError::InvalidShape { .. }));
     }
 
+    // -----------------------------------------------------------------------
+    // TernaryWeight — packed `new()` constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ternary_weight_new_packed_validates() {
+        // 6 elements: 2 rows × 3 cols, row-aligned → 2 * ceil(3/4) = 2 packed bytes
+        // Pack each row independently to byte boundary.
+        let row0 = pack_ternary(&[1i8, 0, -1]);
+        let row1 = pack_ternary(&[1i8, 0, -1]);
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&row0);
+        packed.extend_from_slice(&row1);
+        assert_eq!(packed.len(), 2);
+        let tw = TernaryWeight::new(packed, 0.5, 2, 3).unwrap();
+        assert_eq!(tw.rows, 2);
+        assert_eq!(tw.cols, 3);
+        assert_eq!(tw.numel(), 6);
+        assert_eq!(tw.scale, 0.5);
+        assert_eq!(tw.get(0, 0), 1);
+        assert_eq!(tw.get(0, 2), -1);
+        assert_eq!(tw.get(1, 1), 0);
+    }
+
+    #[test]
+    fn ternary_weight_new_packed_wrong_bytes_rejected() {
+        // 6 elements need 2 packed bytes, provide 1
+        let packed = vec![0u8; 1];
+        let err = TernaryWeight::new(packed, 0.5, 2, 3).unwrap_err();
+        assert!(matches!(err, BitNetError::InvalidShape { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // TernaryWeight — `from_i8()` constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ternary_weight_new_validates_shape() {
+        let data = vec![1i8, 0, -1, 1, 0, -1];
+        let tw = TernaryWeight::from_i8(&data, 0.5, 2, 3).unwrap();
+        assert_eq!(tw.rows, 2);
+        assert_eq!(tw.cols, 3);
+        assert_eq!(tw.numel(), 6);
+        assert_eq!(tw.scale, 0.5);
+    }
+
+    #[test]
+    fn ternary_weight_wrong_size_rejected() {
+        let data = vec![1i8, 0, -1];
+        let err = TernaryWeight::from_i8(&data, 0.5, 2, 3).unwrap_err();
+        assert!(matches!(err, BitNetError::InvalidShape { .. }));
+    }
+
+    #[test]
+    fn ternary_weight_nonpositive_scale_rejected() {
+        let data = vec![1i8, 0, -1, 0, 1, -1];
+        let err = TernaryWeight::from_i8(&data, 0.0, 2, 3).unwrap_err();
+        assert!(matches!(err, BitNetError::QuantizationError(_)));
+    }
+
+    #[test]
+    fn ternary_weight_row_accessor() {
+        let data: Vec<i8> = vec![1, 0, -1, 0, 1, 1];
+        let tw = TernaryWeight::from_i8(&data, 1.0, 2, 3).unwrap();
+        assert_eq!(tw.row_unpacked(0), vec![1i8, 0, -1]);
+        assert_eq!(tw.row_unpacked(1), vec![0i8, 1, 1]);
+    }
+
+    #[test]
+    fn ternary_weight_from_i8_roundtrip() {
+        let data: Vec<i8> = vec![1, 0, -1, 0, 1, 1, -1, -1];
+        let tw = TernaryWeight::from_i8(&data, 1.0, 2, 4).unwrap();
+        assert_eq!(tw.rows, 2);
+        assert_eq!(tw.cols, 4);
+        assert_eq!(tw.packed_cols(), 1);
+        assert_eq!(tw.data.len(), 2); // 8 elements = 2 packed bytes
+                                      // Verify round-trip
+        for (i, &expected) in data.iter().enumerate() {
+            let row = i / 4;
+            let col = i % 4;
+            assert_eq!(tw.get(row, col), expected, "mismatch at ({row}, {col})");
+        }
+    }
+
     #[test]
     fn ternary_weight_packed_bytes_count() {
-        let cfg_cases = [(4, 4, 4), (4, 5, 5), (3, 3, 3)];
+        let cfg_cases = [(4, 4, 4), (4, 5, 8), (3, 3, 3)];
         for (rows, cols, expected_bytes) in cfg_cases {
             let data = vec![0i8; rows * cols];
-            let tw = TernaryWeight::new(data, 1.0, rows, cols).unwrap();
+            let tw = TernaryWeight::from_i8(&data, 1.0, rows, cols).unwrap();
             assert_eq!(tw.packed_bytes(), expected_bytes, "rows={rows} cols={cols}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TernaryWeight — element access and packed_row
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ternary_weight_get_all_values() {
+        // Verify get() returns correct values for each ternary code.
+        let data: Vec<i8> = vec![1, 0, -1, 1];
+        let tw = TernaryWeight::from_i8(&data, 1.0, 1, 4).unwrap();
+        assert_eq!(tw.get(0, 0), 1);
+        assert_eq!(tw.get(0, 1), 0);
+        assert_eq!(tw.get(0, 2), -1);
+        assert_eq!(tw.get(0, 3), 1);
+    }
+
+    #[test]
+    fn ternary_weight_packed_row_slice() {
+        // 2 rows × 4 cols → each row is 1 packed byte
+        let data: Vec<i8> = vec![1, 1, 1, 1, -1, -1, -1, -1];
+        let tw = TernaryWeight::from_i8(&data, 1.0, 2, 4).unwrap();
+        assert_eq!(tw.packed_row(0), &[0x00]); // four +1 → 0x00
+        assert_eq!(tw.packed_row(1), &[0xAA]); // four -1 → 0xAA
+    }
+
+    #[test]
+    fn ternary_weight_pack_returns_clone() {
+        let data: Vec<i8> = vec![1, 0, -1, 0];
+        let tw = TernaryWeight::from_i8(&data, 1.0, 1, 4).unwrap();
+        let packed_clone = tw.pack();
+        assert_eq!(packed_clone, tw.data);
     }
 }

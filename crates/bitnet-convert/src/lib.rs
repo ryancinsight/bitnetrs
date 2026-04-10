@@ -312,7 +312,7 @@ pub fn decode_packed_projection(
     // of α_W² error per layer that compounded across 30 layers and produced
     // degenerate text ("the, and the, and the, …").
     let effective_scale = weight_scale;
-    let weight = TernaryWeight::new(logical, effective_scale, logical_rows, cols)
+    let weight = TernaryWeight::from_i8(&logical, effective_scale, logical_rows, cols)
         .context("failed to construct canonical ternary weight")?;
 
     Ok(CanonicalProjection { kind, weight })
@@ -737,6 +737,16 @@ mod tests {
     use bitnet_core::config::bitnet_2b_config;
     use std::collections::BTreeMap;
 
+    /// Unpack all ternary values from a `TernaryWeight` with row-aligned packed
+    /// data, returning a flat `Vec<i8>` of logical elements in row-major order.
+    fn unpack_all(tw: &TernaryWeight) -> Vec<i8> {
+        let mut all = Vec::with_capacity(tw.rows * tw.cols);
+        for r in 0..tw.rows {
+            all.extend_from_slice(&tw.row_unpacked(r));
+        }
+        all
+    }
+
     fn scalar_scale_bytes_to_f32(bytes: &[u8], dtype: &str) -> anyhow::Result<f32> {
         match dtype {
             "BF16" => {
@@ -794,18 +804,19 @@ mod tests {
         assert_eq!(decoded.weight.rows, 8);
         assert_eq!(decoded.weight.cols, 4);
         assert_eq!(decoded.weight.scale, 2.0);
+        let all_data = unpack_all(&decoded.weight);
         // Rows 0,1 (shift_idx=0): all -1
-        assert_eq!(row_slice(&decoded.weight.data, 4, 0), &[-1, -1, -1, -1]);
-        assert_eq!(row_slice(&decoded.weight.data, 4, 1), &[-1, -1, -1, -1]);
+        assert_eq!(row_slice(&all_data, 4, 0), &[-1, -1, -1, -1]);
+        assert_eq!(row_slice(&all_data, 4, 1), &[-1, -1, -1, -1]);
         // Rows 2,3 (shift_idx=1): all 0
-        assert_eq!(row_slice(&decoded.weight.data, 4, 2), &[0, 0, 0, 0]);
-        assert_eq!(row_slice(&decoded.weight.data, 4, 3), &[0, 0, 0, 0]);
+        assert_eq!(row_slice(&all_data, 4, 2), &[0, 0, 0, 0]);
+        assert_eq!(row_slice(&all_data, 4, 3), &[0, 0, 0, 0]);
         // Rows 4,5 (shift_idx=2): all +1
-        assert_eq!(row_slice(&decoded.weight.data, 4, 4), &[1, 1, 1, 1]);
-        assert_eq!(row_slice(&decoded.weight.data, 4, 5), &[1, 1, 1, 1]);
+        assert_eq!(row_slice(&all_data, 4, 4), &[1, 1, 1, 1]);
+        assert_eq!(row_slice(&all_data, 4, 5), &[1, 1, 1, 1]);
         // Rows 6,7 (shift_idx=3): all 0
-        assert_eq!(row_slice(&decoded.weight.data, 4, 6), &[0, 0, 0, 0]);
-        assert_eq!(row_slice(&decoded.weight.data, 4, 7), &[0, 0, 0, 0]);
+        assert_eq!(row_slice(&all_data, 4, 6), &[0, 0, 0, 0]);
+        assert_eq!(row_slice(&all_data, 4, 7), &[0, 0, 0, 0]);
     }
 
     fn ternary_histogram(data: &[i8]) -> BTreeMap<i8, usize> {
@@ -864,8 +875,9 @@ mod tests {
 
         assert_eq!(decoded.weight.rows, rows);
         assert_eq!(decoded.weight.cols, cols);
-        assert_eq!(decoded.weight.data.len(), logical_numel);
-        assert!(decoded.weight.data.iter().all(|&v| (-1..=1).contains(&v)));
+        let all_data = unpack_all(&decoded.weight);
+        assert_eq!(all_data.len(), logical_numel);
+        assert!(all_data.iter().all(|&v| (-1..=1).contains(&v)));
     }
 
     #[test]
@@ -942,8 +954,9 @@ mod tests {
             decoded.weight.cols, cfg.hidden_size,
             "q_proj logical cols must equal hidden_size"
         );
+        let all_data = unpack_all(&decoded.weight);
         assert!(
-            decoded.weight.data.iter().all(|&v| (-1..=1).contains(&v)),
+            all_data.iter().all(|&v| (-1..=1).contains(&v)),
             "decoded q_proj values must remain ternary"
         );
         assert!(
@@ -952,10 +965,10 @@ mod tests {
             decoded.weight.scale
         );
 
-        let histogram = ternary_histogram(&decoded.weight.data);
+        let histogram = ternary_histogram(&all_data);
         assert_eq!(
             histogram.values().sum::<usize>(),
-            decoded.weight.data.len(),
+            all_data.len(),
             "ternary histogram must account for every decoded element"
         );
     }
@@ -1079,13 +1092,15 @@ mod tests {
 
         let packed_row0 = packed_row_bytes(q_weight, 0);
         let packed_row1 = packed_row_bytes(q_weight, 1);
-        let decoded_row0 = row_slice(&q_decoded.weight.data, q_decoded.weight.cols, 0);
-        let decoded_row1 = row_slice(&q_decoded.weight.data, q_decoded.weight.cols, 1);
-        let unpermuted_row0 = row_slice(&q_unpermuted.weight.data, q_unpermuted.weight.cols, 0);
-        let unpermuted_row1 = row_slice(&q_unpermuted.weight.data, q_unpermuted.weight.cols, 1);
+        let decoded_row0 = q_decoded.weight.row_unpacked(0);
+        let decoded_row1 = q_decoded.weight.row_unpacked(1);
+        let unpermuted_row0 = q_unpermuted.weight.row_unpacked(0);
+        let unpermuted_row1 = q_unpermuted.weight.row_unpacked(1);
 
-        let q_histogram = ternary_histogram(&q_decoded.weight.data);
-        let q_unpermuted_histogram = ternary_histogram(&q_unpermuted.weight.data);
+        let q_all_data = unpack_all(&q_decoded.weight);
+        let q_unpermuted_all_data = unpack_all(&q_unpermuted.weight);
+        let q_histogram = ternary_histogram(&q_all_data);
+        let q_unpermuted_histogram = ternary_histogram(&q_unpermuted_all_data);
 
         warn!(
             packed_shape = ?q_weight.shape,
@@ -1271,7 +1286,7 @@ mod tests {
         .expect("layer-0 q_proj must canonically decode");
 
         let cols = decoded.weight.cols;
-        let data = &decoded.weight.data;
+        let data = unpack_all(&decoded.weight);
 
         // Helper to extract first 8 elements of a row
         let row8 = |r: usize| -> Vec<i8> { data[r * cols..r * cols + 8].to_vec() };
@@ -1305,7 +1320,7 @@ mod tests {
         assert_eq!(decoded.weight.cols, 2560);
 
         // Verify ternary distribution matches Python: ~25.2% -1, ~49.6% 0, ~25.2% +1
-        let histogram = ternary_histogram(data);
+        let histogram = ternary_histogram(&data);
         let total = data.len() as f64;
         let pct_neg1 = *histogram.get(&-1).unwrap_or(&0) as f64 / total * 100.0;
         let pct_zero = *histogram.get(&0).unwrap_or(&0) as f64 / total * 100.0;

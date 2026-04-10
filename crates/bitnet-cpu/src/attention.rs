@@ -58,9 +58,15 @@
 //! - `n_heads % n_kv_heads == 0`
 //! - `head_dim > 0`
 
+use std::cell::RefCell;
+
 use bitnet_core::backend::ops::softmax_f32;
 use bitnet_core::error::{BitNetError, Result};
 use rayon::prelude::*;
+
+thread_local! {
+    static SCORE_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -162,35 +168,39 @@ pub fn masked_attention(
             let kv_h = h / heads_per_group;
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-            // Per-thread scores buffer.
-            let mut scores = vec![0.0_f32; seq_len];
+            // Reuse a thread-local scores buffer to avoid per-head heap allocation.
+            SCORE_BUF.with(|buf| {
+                let mut scores = buf.borrow_mut();
+                scores.clear();
+                scores.resize(seq_len, 0.0_f32);
 
-            // Compute attention scores: score[t] = dot(q_head, k_cache[t, kv_h]) * scale
-            for t in 0..seq_len {
-                let k_offset = t * kv_stride + kv_h * head_dim;
-                let k_head = &k_cache[k_offset..k_offset + head_dim];
-                let mut dot = 0.0_f32;
-                for d in 0..head_dim {
-                    dot += q_head[d] * k_head[d];
+                // Compute attention scores: score[t] = dot(q_head, k_cache[t, kv_h]) * scale
+                for t in 0..seq_len {
+                    let k_offset = t * kv_stride + kv_h * head_dim;
+                    let k_head = &k_cache[k_offset..k_offset + head_dim];
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += q_head[d] * k_head[d];
+                    }
+                    scores[t] = dot * scale;
                 }
-                scores[t] = dot * scale;
-            }
 
-            // Numerically-stable softmax over scores[0..seq_len].
-            softmax_f32(&mut scores[..seq_len]);
+                // Numerically-stable softmax over scores[0..seq_len].
+                softmax_f32(&mut scores[..seq_len]);
 
-            // Compute attended output: out_head = Σ_t attn[t] * v_cache[t, kv_h]
-            for d in 0..head_dim {
-                out_head[d] = 0.0;
-            }
-            for t in 0..seq_len {
-                let v_offset = t * kv_stride + kv_h * head_dim;
-                let v_head = &v_cache[v_offset..v_offset + head_dim];
-                let attn_weight = scores[t];
+                // Compute attended output: out_head = Σ_t attn[t] * v_cache[t, kv_h]
                 for d in 0..head_dim {
-                    out_head[d] += attn_weight * v_head[d];
+                    out_head[d] = 0.0;
                 }
-            }
+                for t in 0..seq_len {
+                    let v_offset = t * kv_stride + kv_h * head_dim;
+                    let v_head = &v_cache[v_offset..v_offset + head_dim];
+                    let attn_weight = scores[t];
+                    for d in 0..head_dim {
+                        out_head[d] += attn_weight * v_head[d];
+                    }
+                }
+            });
         });
 
     Ok(())

@@ -134,21 +134,24 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// Computes:
     /// ```text
-    /// output[i] = Σ_j  weight[i * in_features + j] as f32 * input[j] * weight_scale
+    /// output[i] = Σ_j  unpack(weight_packed)[i * in_features + j] as f32 * input[j] * weight_scale
     /// ```
-    /// where `weight[k] ∈ {−1, 0, +1}` and `weight_scale = α_W > 0`.
+    /// where unpacked `weight[k] ∈ {−1, 0, +1}` and `weight_scale = α_W > 0`.
     ///
     /// # Shapes
-    /// - `weight`:  `[out_features × in_features]` row-major, values in `{-1, 0, 1}`.
+    /// - `weight_packed`: Packed 2-bit ternary weights, `[ceil(out_features * in_features / 4)]` bytes.
+    ///                    Each byte holds 4 ternary values in {-1, 0, +1}.
+    ///                    Encoding: `byte = v0 | (v1 << 2) | (v2 << 4) | (v3 << 6)`.
+    ///                    Codes: `0b00→+1, 0b01→0, 0b10→-1`.
     /// - `input`:   `[in_features]`
     /// - `output`:  `[out_features]` — pre-allocated, overwritten on success.
     ///
     /// # Errors
-    /// Returns `Err` if `weight.len() != out_features * in_features` or
+    /// Returns `Err` if `weight_packed.len() != ceil(out_features * in_features / 4)` or
     /// `input.len() != in_features` or `output.len() != out_features`.
     fn ternary_gemv(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -166,7 +169,7 @@ pub trait Backend: Send + Sync + 'static {
     /// ```text
     /// x_q    = clip(round(input × 127 / max(|input|)), −128, 127)
     /// α_x    = max(|input|) / 127
-    /// output[i] = (Σ_j weight[i,j] × x_q[j]) × weight_scale × α_x
+    /// output[i] = (Σ_j unpack(weight_packed)[i,j] × x_q[j]) × weight_scale × α_x
     /// ```
     ///
     /// The default implementation quantises and dequantises the input, then
@@ -181,7 +184,7 @@ pub trait Backend: Send + Sync + 'static {
     /// [`BitNetError::QuantizationError`] if input contains non-finite values.
     fn ternary_gemv_with_activation_quant(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -194,7 +197,7 @@ pub trait Backend: Send + Sync + 'static {
         let (x_q, scale) = crate::quant::absmax::absmax_quantize_row(input).map_err(|e| e)?;
         let x_dq = crate::quant::absmax::absmax_dequantize(&x_q, scale).map_err(|e| e)?;
         self.ternary_gemv(
-            weight,
+            weight_packed,
             weight_scale,
             &x_dq,
             output,
@@ -352,7 +355,7 @@ pub trait Backend: Send + Sync + 'static {
 impl Backend for Arc<dyn Backend> {
     fn ternary_gemv(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -360,7 +363,7 @@ impl Backend for Arc<dyn Backend> {
         in_features: usize,
     ) -> Result<()> {
         (**self).ternary_gemv(
-            weight,
+            weight_packed,
             weight_scale,
             input,
             output,
@@ -371,7 +374,7 @@ impl Backend for Arc<dyn Backend> {
 
     fn ternary_gemv_with_activation_quant(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -379,7 +382,7 @@ impl Backend for Arc<dyn Backend> {
         in_features: usize,
     ) -> Result<()> {
         (**self).ternary_gemv_with_activation_quant(
-            weight,
+            weight_packed,
             weight_scale,
             input,
             output,

@@ -174,12 +174,15 @@ mod tests {
         // input = [2, 3, 4]
         // row 0: 1*2 + 0*3 + (-1)*4 = -2 → -2 * 0.5 = -1.0
         // row 1: (-1)*2 + 1*3 + 0*4 =  1 →  1 * 0.5 =  0.5
-        let weight: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        let weight_i8: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        // Pack i8 ternary values into row-aligned u8 packed format via TernaryWeight.
+        let tw = bitnet_core::quant::ternary::TernaryWeight::from_i8(&weight_i8, 0.5, 2, 3)
+            .expect("packing test weights must succeed");
         let input = vec![2.0_f32, 3.0, 4.0];
         let mut output = vec![0.0_f32; 2];
 
         backend
-            .ternary_gemv(&weight, 0.5, &input, &mut output, 2, 3)
+            .ternary_gemv(&tw.data, 0.5, &input, &mut output, 2, 3)
             .expect("ternary_gemv must succeed");
 
         assert!(

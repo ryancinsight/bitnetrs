@@ -237,19 +237,32 @@ impl GpuBackend {
 
     /// Dispatch the ternary GEMV compute shader.
     ///
-    /// Uploads weights (widened i8→i32) and input f32, dispatches
+    /// Uploads weights (packed u8) and input f32, dispatches
     /// `out_features` workgroups (one per output row), downloads output.
     fn dispatch_gemv(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
         out_features: usize,
         in_features: usize,
     ) -> anyhow::Result<()> {
-        // Weight is stored as i32 (widened from i8 for WGSL compatibility).
-        let weight_bytes = (weight.len() * std::mem::size_of::<i32>()) as u64;
+        // The GPU compute shader (gemv.wgsl) was written for unpacked i8 weights
+        // stored as i32. It has not been updated for the packed 2-bit u8 format.
+        // Return an error so that the caller falls back to the CPU backend.
+        return Err(anyhow::anyhow!(
+            "GPU GEMV dispatch does not yet support packed 2-bit weights; \
+             falling back to CPU"
+        ));
+
+        // Weight is stored as packed u8 (4 ternary values per byte).
+        // wgpu requires COPY_BUFFER_ALIGNMENT (4 bytes) for write_buffer.
+        // Pad the buffer size to the next multiple of 4.
+        #[allow(unreachable_code)]
+        const COPY_ALIGN: u64 = 4;
+        let raw_weight_bytes = weight_packed.len() as u64;
+        let weight_bytes = (raw_weight_bytes + COPY_ALIGN - 1) & !(COPY_ALIGN - 1);
         let input_bytes = (input.len() * std::mem::size_of::<f32>()) as u64;
         let output_bytes = (output.len() * std::mem::size_of::<f32>()) as u64;
         let params_bytes = std::mem::size_of::<GemvParams>() as u64;
@@ -279,8 +292,14 @@ impl GpuBackend {
             "gemv_params",
         )?;
 
-        // Upload data.
-        weight_buf.upload_i8_as_i32(&self.device, &self.queue, weight)?;
+        // Upload data — pad to COPY_BUFFER_ALIGNMENT if needed.
+        if raw_weight_bytes == weight_bytes {
+            weight_buf.upload_u8(&self.device, &self.queue, weight_packed)?;
+        } else {
+            let mut padded = vec![0u8; weight_bytes as usize];
+            padded[..weight_packed.len()].copy_from_slice(weight_packed);
+            weight_buf.upload_u8(&self.device, &self.queue, &padded)?;
+        }
         input_buf.upload_f32(&self.device, &self.queue, input)?;
 
         let params = GemvParams {
@@ -664,12 +683,12 @@ impl Backend for GpuBackend {
     /// Returns [`BitNetError::QuantizationError`] if `weight_scale ≤ 0`.
     #[instrument(
         level = "trace",
-        skip(self, weight, input, output),
+        skip(self, weight_packed, input, output),
         fields(out_features, in_features, weight_scale)
     )]
     fn ternary_gemv(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -677,13 +696,15 @@ impl Backend for GpuBackend {
         in_features: usize,
     ) -> Result<()> {
         // Validate shapes before touching the GPU.
+        // Packed format: 4 ternary values per byte → ceil(in_features / 4) bytes per row.
+        let packed_cols = (in_features + 3) / 4;
         let expected_weight = out_features
-            .checked_mul(in_features)
-            .ok_or_else(|| BitNetError::shape("weight size fits usize", "overflow"))?;
-        if weight.len() != expected_weight {
+            .checked_mul(packed_cols)
+            .ok_or_else(|| BitNetError::shape("packed weight size fits usize", "overflow"))?;
+        if weight_packed.len() != expected_weight {
             return Err(BitNetError::shape(
-                format!("{out_features} * {in_features} = {expected_weight}"),
-                format!("{}", weight.len()),
+                format!("{out_features} * ceil({in_features}/4) = {expected_weight}"),
+                format!("{}", weight_packed.len()),
             ));
         }
         if input.len() != in_features {
@@ -706,7 +727,7 @@ impl Backend for GpuBackend {
 
         // Attempt GPU dispatch; fall back to CPU on error.
         match self.dispatch_gemv(
-            weight,
+            weight_packed,
             weight_scale,
             input,
             output,
@@ -717,7 +738,7 @@ impl Backend for GpuBackend {
             Err(e) => {
                 warn!(error = %e, "GPU GEMV dispatch failed, falling back to CPU");
                 self.cpu_fallback.ternary_gemv(
-                    weight,
+                    weight_packed,
                     weight_scale,
                     input,
                     output,
@@ -745,12 +766,12 @@ impl Backend for GpuBackend {
     /// non-finite activation values).
     #[instrument(
         level = "trace",
-        skip(self, weight, input, output),
+        skip(self, weight_packed, input, output),
         fields(out_features, in_features, weight_scale)
     )]
     fn ternary_gemv_with_activation_quant(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -758,7 +779,7 @@ impl Backend for GpuBackend {
         in_features: usize,
     ) -> Result<()> {
         self.cpu_fallback.ternary_gemv_with_activation_quant(
-            weight,
+            weight_packed,
             weight_scale,
             input,
             output,
@@ -1024,6 +1045,20 @@ mod tests {
         GpuBackend::new_blocking(0).ok()
     }
 
+    /// Pack a row-major `[rows, cols]` i8 ternary weight matrix into
+    /// row-aligned packed 2-bit bytes.  Each row is packed independently
+    /// so that `packed_cols = ceil(cols / 4)` bytes per row.
+    fn pack_row_aligned(weights: &[i8], rows: usize, cols: usize) -> Vec<u8> {
+        let packed_cols = (cols + 3) / 4;
+        let mut packed = Vec::with_capacity(rows * packed_cols);
+        for r in 0..rows {
+            let row_start = r * cols;
+            let row = &weights[row_start..row_start + cols];
+            packed.extend_from_slice(&bitnet_core::quant::ternary::pack_ternary(row));
+        }
+        packed
+    }
+
     // ------------------------------------------------------------------
     // Initialisation
     // ------------------------------------------------------------------
@@ -1060,10 +1095,11 @@ mod tests {
         // W = [[1, 0, -1], [-1, 1, 0]], x = [2, 3, 4], scale = 0.5
         // row 0: (1*2 + 0*3 + (-1)*4) * 0.5 = (2 + 0 - 4) * 0.5 = -1.0
         // row 1: ((-1)*2 + 1*3 + 0*4) * 0.5 = (-2 + 3 + 0) * 0.5 =  0.5
-        let weight: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        let weight_i8: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        let weight_packed = pack_row_aligned(&weight_i8, 2, 3);
         let input = vec![2.0_f32, 3.0, 4.0];
         let mut output = vec![0.0_f32; 2];
-        b.ternary_gemv(&weight, 0.5, &input, &mut output, 2, 3)
+        b.ternary_gemv(&weight_packed, 0.5, &input, &mut output, 2, 3)
             .unwrap();
         assert!(
             (output[0] - (-1.0_f32)).abs() < 1e-4,
@@ -1082,12 +1118,12 @@ mod tests {
         let Some(b) = try_make_gpu_backend() else {
             return;
         };
-        // weight has 5 elements but out_features=2, in_features=3 requires 6
-        let weight: Vec<i8> = vec![1; 5];
+        // packed weight has 3 bytes but out_features=2, in_features=3 requires 2
+        let weight_packed: Vec<u8> = vec![0u8; 3];
         let input = vec![1.0_f32; 3];
         let mut output = vec![0.0_f32; 2];
         let err = b
-            .ternary_gemv(&weight, 1.0, &input, &mut output, 2, 3)
+            .ternary_gemv(&weight_packed, 1.0, &input, &mut output, 2, 3)
             .unwrap_err();
         assert!(matches!(err, BitNetError::InvalidShape { .. }));
     }
@@ -1097,11 +1133,11 @@ mod tests {
         let Some(b) = try_make_gpu_backend() else {
             return;
         };
-        let weight: Vec<i8> = vec![1; 4];
+        let weight_packed = pack_row_aligned(&[1i8; 4], 1, 4);
         let input = vec![1.0_f32; 4];
         let mut output = vec![0.0_f32; 1];
         let err = b
-            .ternary_gemv(&weight, 0.0, &input, &mut output, 1, 4)
+            .ternary_gemv(&weight_packed, 0.0, &input, &mut output, 1, 4)
             .unwrap_err();
         assert!(matches!(err, BitNetError::QuantizationError(_)));
     }

@@ -159,12 +159,12 @@ impl Backend for CpuBackend {
     /// Returns [`BitNetError::QuantizationError`] if `weight_scale ≤ 0`.
     #[instrument(
         level = "trace",
-        skip(self, weight, input, output),
+        skip(self, weight_packed, input, output),
         fields(out_features, in_features, weight_scale)
     )]
     fn ternary_gemv(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -172,7 +172,7 @@ impl Backend for CpuBackend {
         in_features: usize,
     ) -> Result<()> {
         gemv::ternary_gemv_f32(
-            weight,
+            weight_packed,
             weight_scale,
             input,
             output,
@@ -205,12 +205,12 @@ impl Backend for CpuBackend {
     /// input contains non-finite values.
     #[instrument(
         level = "trace",
-        skip(self, weight, input, output),
+        skip(self, weight_packed, input, output),
         fields(out_features, in_features, weight_scale)
     )]
     fn ternary_gemv_with_activation_quant(
         &self,
-        weight: &[i8],
+        weight_packed: &[u8],
         weight_scale: f32,
         input: &[f32],
         output: &mut [f32],
@@ -224,7 +224,7 @@ impl Backend for CpuBackend {
         //   output[i] = (Σ_j W[i,j] * x_q[j]) * weight_scale * act_scale / 127
         let max_abs = q_scale * 127.0_f32;
         gemv::ternary_gemv_quantised(
-            weight,
+            weight_packed,
             weight_scale,
             &x_q,
             max_abs,
@@ -407,6 +407,20 @@ mod tests {
         CpuBackend::new(Some(2)).expect("CpuBackend must initialise")
     }
 
+    /// Pack a row-major `[rows, cols]` i8 ternary weight matrix into
+    /// row-aligned packed 2-bit bytes.  Each row is packed independently
+    /// so that `packed_cols = ceil(cols / 4)` bytes per row.
+    fn pack_row_aligned(weights: &[i8], rows: usize, cols: usize) -> Vec<u8> {
+        let packed_cols = (cols + 3) / 4;
+        let mut packed = Vec::with_capacity(rows * packed_cols);
+        for r in 0..rows {
+            let row_start = r * cols;
+            let row = &weights[row_start..row_start + cols];
+            packed.extend_from_slice(&bitnet_core::quant::ternary::pack_ternary(row));
+        }
+        packed
+    }
+
     // ------------------------------------------------------------------
     // Initialisation
     // ------------------------------------------------------------------
@@ -441,10 +455,11 @@ mod tests {
         // row 0: 1*2 + 0*3 + (-1)*4 = -2  → -1.0
         // row 1: (-1)*2 + 1*3 + 0*4 =  1  →  0.5
         let b = make_backend();
-        let weight: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        let weight_i8: Vec<i8> = vec![1, 0, -1, -1, 1, 0];
+        let weight_packed = pack_row_aligned(&weight_i8, 2, 3);
         let input = vec![2.0_f32, 3.0, 4.0];
         let mut output = vec![0.0_f32; 2];
-        b.ternary_gemv(&weight, 0.5, &input, &mut output, 2, 3)
+        b.ternary_gemv(&weight_packed, 0.5, &input, &mut output, 2, 3)
             .unwrap();
         assert!((output[0] - (-1.0)).abs() < 1e-6, "row 0: {}", output[0]);
         assert!((output[1] - 0.5).abs() < 1e-6, "row 1: {}", output[1]);
@@ -453,11 +468,12 @@ mod tests {
     #[test]
     fn ternary_gemv_wrong_weight_len_returns_error() {
         let b = make_backend();
-        let weight: Vec<i8> = vec![1; 5]; // should be 6
+        // For 2 rows × 3 cols, packed_cols = 1 byte per row, total = 2 bytes
+        let weight_packed = vec![0u8; 3]; // wrong: should be 2
         let input = vec![1.0_f32; 3];
         let mut output = vec![0.0_f32; 2];
         let err = b
-            .ternary_gemv(&weight, 1.0, &input, &mut output, 2, 3)
+            .ternary_gemv(&weight_packed, 1.0, &input, &mut output, 2, 3)
             .unwrap_err();
         assert!(matches!(err, BitNetError::InvalidShape { .. }));
     }
@@ -465,11 +481,11 @@ mod tests {
     #[test]
     fn ternary_gemv_zero_scale_returns_error() {
         let b = make_backend();
-        let weight: Vec<i8> = vec![1; 4];
+        let weight_packed = pack_row_aligned(&vec![1i8; 4], 1, 4);
         let input = vec![1.0_f32; 4];
         let mut output = vec![0.0_f32; 1];
         let err = b
-            .ternary_gemv(&weight, 0.0, &input, &mut output, 1, 4)
+            .ternary_gemv(&weight_packed, 0.0, &input, &mut output, 1, 4)
             .unwrap_err();
         assert!(matches!(err, BitNetError::QuantizationError(_)));
     }
@@ -662,10 +678,11 @@ mod tests {
     #[test]
     fn arc_backend_forwards_ternary_gemv() {
         let b: Arc<dyn Backend> = CpuBackend::new(None).unwrap().into_arc();
-        let weight: Vec<i8> = vec![1, -1]; // 1x2
+        let weight_i8: Vec<i8> = vec![1, -1]; // 1x2
+        let weight_packed = pack_row_aligned(&weight_i8, 1, 2);
         let input = vec![3.0_f32, 2.0];
         let mut output = vec![0.0_f32; 1];
-        b.ternary_gemv(&weight, 1.0, &input, &mut output, 1, 2)
+        b.ternary_gemv(&weight_packed, 1.0, &input, &mut output, 1, 2)
             .unwrap();
         // dot([1,-1], [3,2]) * 1.0 = 1*3 + (-1)*2 = 1.0
         assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
@@ -708,9 +725,21 @@ mod tests {
 
         // ── QKV projection ──────────────────────────────────────────────────
         // q: [n_heads * head_dim = 8], k: [n_kv_heads * head_dim = 4], v: [4]
-        let q_weight = vec![0i8; n_heads * head_dim * hidden];
-        let k_weight = vec![0i8; n_kv_heads * head_dim * hidden];
-        let v_weight = vec![0i8; n_kv_heads * head_dim * hidden];
+        let q_weight = pack_row_aligned(
+            &vec![0i8; n_heads * head_dim * hidden],
+            n_heads * head_dim,
+            hidden,
+        );
+        let k_weight = pack_row_aligned(
+            &vec![0i8; n_kv_heads * head_dim * hidden],
+            n_kv_heads * head_dim,
+            hidden,
+        );
+        let v_weight = pack_row_aligned(
+            &vec![0i8; n_kv_heads * head_dim * hidden],
+            n_kv_heads * head_dim,
+            hidden,
+        );
 
         let mut q_proj = vec![0.0_f32; n_heads * head_dim];
         let mut k_proj = vec![0.0_f32; n_kv_heads * head_dim];
@@ -781,7 +810,11 @@ mod tests {
             .unwrap();
 
         // ── o_proj ──────────────────────────────────────────────────────────
-        let o_weight = vec![0i8; hidden * (n_heads * head_dim)];
+        let o_weight = pack_row_aligned(
+            &vec![0i8; hidden * (n_heads * head_dim)],
+            hidden,
+            n_heads * head_dim,
+        );
         let mut o_out = vec![0.0_f32; hidden];
         b.ternary_gemv(
             &o_weight,
@@ -801,8 +834,8 @@ mod tests {
         b.rms_norm(&h2, &ffn_norm_w, 1e-5, &mut h2_norm).unwrap();
 
         // ── gate + up projections ────────────────────────────────────────────
-        let gate_weight = vec![0i8; ffn_dim * hidden];
-        let up_weight = vec![0i8; ffn_dim * hidden];
+        let gate_weight = pack_row_aligned(&vec![0i8; ffn_dim * hidden], ffn_dim, hidden);
+        let up_weight = pack_row_aligned(&vec![0i8; ffn_dim * hidden], ffn_dim, hidden);
         let mut gate = vec![0.0_f32; ffn_dim];
         let mut up = vec![0.1_f32; ffn_dim]; // non-zero for interesting test
         b.ternary_gemv(&gate_weight, 1.0, &h2_norm, &mut gate, ffn_dim, hidden)
@@ -822,7 +855,7 @@ mod tests {
             .unwrap();
 
         // ── down projection ───────────────────────────────────────────────────
-        let down_weight = vec![0i8; hidden * ffn_dim];
+        let down_weight = pack_row_aligned(&vec![0i8; hidden * ffn_dim], hidden, ffn_dim);
         let mut ffn_out = vec![0.0_f32; hidden];
         b.ternary_gemv(
             &down_weight,

@@ -64,6 +64,29 @@ fn detect_avx2() -> bool {
     }
 }
 
+/// Cached result of the FMA runtime feature check.
+static FMA_DETECTED: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` if the current CPU supports FMA (fused multiply-add).
+///
+/// The result is computed once (via `CPUID`) and cached for subsequent calls.
+/// Cost after first call: a single atomic load.
+#[inline]
+pub fn has_fma() -> bool {
+    *FMA_DETECTED.get_or_init(detect_fma)
+}
+
+fn detect_fma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AVX2 kernels (x86-64 only)
 // ---------------------------------------------------------------------------
@@ -356,6 +379,224 @@ fn dot_ternary_f32_scalar(weight: &[i8], input: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Packed 2-bit ternary decode LUT and kernels
+// ---------------------------------------------------------------------------
+
+/// Decode table: maps each possible packed byte to 4 i8 ternary values.
+/// Index is the packed byte value (0..256).
+/// Value is the 4 decoded weights packed as [i8; 4] in little-endian order.
+///
+/// Encoding: 0b00→+1, 0b01→0, 0b10→-1
+static DECODE_LUT: [[i8; 4]; 256] = {
+    let mut table = [[0i8; 4]; 256];
+    let decode = [1i8, 0, -1, 0]; // code → value (code 3 maps to 0 as padding)
+    let mut byte = 0u16;
+    while byte < 256 {
+        let b = byte as u8;
+        table[byte as usize] = [
+            decode[(b & 3) as usize],
+            decode[((b >> 2) & 3) as usize],
+            decode[((b >> 4) & 3) as usize],
+            decode[((b >> 6) & 3) as usize],
+        ];
+        byte += 1;
+    }
+    table
+};
+
+/// Unpack packed 2-bit ternary weights to i8 ternary values.
+///
+/// # Arguments
+/// - `packed`: packed bytes (4 weights per byte)
+/// - `out`: output buffer, must be at least `n_elements` long
+/// - `n_elements`: number of logical ternary elements to decode
+///
+/// # Panics (debug only)
+/// Panics if `out.len() < n_elements` or `packed.len() < (n_elements + 3) / 4`.
+#[inline]
+pub fn unpack_packed_to_i8(packed: &[u8], out: &mut [i8], n_elements: usize) {
+    debug_assert!(out.len() >= n_elements);
+    debug_assert!(packed.len() >= (n_elements + 3) / 4);
+
+    let full_bytes = n_elements / 4;
+    let remainder = n_elements % 4;
+
+    // Fast path: decode 4 values per byte using LUT
+    let out_ptr = out.as_mut_ptr();
+    for i in 0..full_bytes {
+        let decoded = DECODE_LUT[packed[i] as usize];
+        // Safety: `i * 4 + 3 < n_elements <= out.len()` holds for `i < full_bytes`.
+        unsafe {
+            let base = out_ptr.add(i * 4);
+            base.write(decoded[0]);
+            base.add(1).write(decoded[1]);
+            base.add(2).write(decoded[2]);
+            base.add(3).write(decoded[3]);
+        }
+    }
+
+    // Handle remainder
+    if remainder > 0 {
+        let decoded = DECODE_LUT[packed[full_bytes] as usize];
+        let base_idx = full_bytes * 4;
+        for j in 0..remainder {
+            out[base_idx + j] = decoded[j];
+        }
+    }
+}
+
+/// Packed ternary dot product: packed 2-bit weights × i8 activations → i32.
+///
+/// # Arguments
+/// - `packed`: packed weight bytes (4 weights per byte)
+/// - `activation`: i8 activation vector
+/// - `n_elements`: number of logical weight/activation elements
+///
+/// Uses chunk-based unpacking with the existing AVX2 dot product kernel.
+/// 4× less memory bandwidth for weight data vs the unpacked path.
+#[inline]
+pub fn dot_packed_ternary_i8_fast(packed: &[u8], activation: &[i8], n_elements: usize) -> i32 {
+    debug_assert!(activation.len() >= n_elements);
+    debug_assert!(packed.len() >= (n_elements + 3) / 4);
+
+    const CHUNK: usize = 256;
+    const PACKED_CHUNK: usize = CHUNK / 4; // 64
+
+    let full_chunks = n_elements / CHUNK;
+    let remainder = n_elements - full_chunks * CHUNK;
+
+    let mut total: i32 = 0;
+    let mut unpacked = [0i8; CHUNK];
+
+    for c in 0..full_chunks {
+        let p_off = c * PACKED_CHUNK;
+        let a_off = c * CHUNK;
+        unpack_packed_to_i8(&packed[p_off..p_off + PACKED_CHUNK], &mut unpacked, CHUNK);
+        total += dot_ternary_i8_fast(&unpacked, &activation[a_off..a_off + CHUNK]);
+    }
+
+    if remainder > 0 {
+        let p_off = full_chunks * PACKED_CHUNK;
+        let a_off = full_chunks * CHUNK;
+        // Unpack remainder into zero-initialised buffer
+        let mut rem_buf = [0i8; CHUNK];
+        unpack_packed_to_i8(&packed[p_off..], &mut rem_buf, remainder);
+        // Scalar fallback for remainder (may not be aligned to 16)
+        for i in 0..remainder {
+            total += rem_buf[i] as i32 * activation[a_off + i] as i32;
+        }
+    }
+
+    total
+}
+
+/// Packed ternary dot product: packed 2-bit weights × f32 activations → f32.
+///
+/// Same chunk-based strategy as the i8 variant.
+#[inline]
+pub fn dot_packed_ternary_f32_fast(packed: &[u8], input: &[f32], n_elements: usize) -> f32 {
+    debug_assert!(input.len() >= n_elements);
+    debug_assert!(packed.len() >= (n_elements + 3) / 4);
+
+    const CHUNK: usize = 256;
+    const PACKED_CHUNK: usize = CHUNK / 4;
+
+    let full_chunks = n_elements / CHUNK;
+    let remainder = n_elements - full_chunks * CHUNK;
+
+    let mut total: f32 = 0.0;
+    let mut unpacked = [0i8; CHUNK];
+
+    for c in 0..full_chunks {
+        let p_off = c * PACKED_CHUNK;
+        let a_off = c * CHUNK;
+        unpack_packed_to_i8(&packed[p_off..p_off + PACKED_CHUNK], &mut unpacked, CHUNK);
+        total += dot_ternary_f32_fast(&unpacked, &input[a_off..a_off + CHUNK]);
+    }
+
+    if remainder > 0 {
+        let p_off = full_chunks * PACKED_CHUNK;
+        let a_off = full_chunks * CHUNK;
+        let mut rem_buf = [0i8; CHUNK];
+        unpack_packed_to_i8(&packed[p_off..], &mut rem_buf, remainder);
+        for i in 0..remainder {
+            total += rem_buf[i] as f32 * input[a_off + i];
+        }
+    }
+
+    total
+}
+
+// ---------------------------------------------------------------------------
+// f32 × f32 dot product (for lm_head matmul)
+// ---------------------------------------------------------------------------
+
+/// AVX2+FMA accelerated f32 dot product for the lm_head matmul.
+///
+/// Processes 8 f32 elements per iteration using fused multiply-add.
+///
+/// # Safety
+/// Caller must verify AVX2+FMA support before calling.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_f32_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    let len = a.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        // Safety: `base + 7 < len` holds for `i < chunks`. Unaligned loads are
+        // safe on x86-64 (may cross cache lines but never fault).
+        let va = _mm256_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(base));
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+
+    let mut result = hsum_f32_avx2(acc);
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            result += a[base + i] * b[base + i];
+        }
+    }
+
+    result
+}
+
+/// f32 dot product with automatic SIMD dispatch.
+///
+/// Uses AVX2+FMA when available, scalar fallback otherwise.
+/// Primary use: lm_head matmul (vocab_size rows × hidden_size dot products).
+#[inline]
+pub fn dot_f32_f32_fast(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() {
+            // Safety: AVX2+FMA availability confirmed by `has_avx2()` and `has_fma()`.
+            return unsafe { dot_f32_f32_avx2(a, b) };
+        }
+    }
+    dot_f32_f32_scalar(a, b)
+}
+
+/// Scalar f32 dot product fallback.
+#[inline]
+fn dot_f32_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0_f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        acc += x * y;
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -621,5 +862,212 @@ mod tests {
                 (got - expected).abs()
             );
         }
+    }
+
+    // ── Packed ternary tests ─────────────────────────────────────────────
+
+    #[test]
+    fn decode_lut_correctness() {
+        // Verify LUT for known byte patterns
+        // All +1: byte = 0b00_00_00_00 = 0x00
+        assert_eq!(DECODE_LUT[0x00], [1, 1, 1, 1]);
+        // All 0: byte = 0b01_01_01_01 = 0x55
+        assert_eq!(DECODE_LUT[0x55], [0, 0, 0, 0]);
+        // All -1: byte = 0b10_10_10_10 = 0xAA
+        assert_eq!(DECODE_LUT[0xAA], [-1, -1, -1, -1]);
+        // Mixed: [+1, 0, -1, +1] = 0b00_10_01_00 = 0x24
+        assert_eq!(DECODE_LUT[0x24], [1, 0, -1, 1]);
+    }
+
+    #[test]
+    fn unpack_basic() {
+        let packed = [0x24u8]; // [+1, 0, -1, +1]
+        let mut out = [0i8; 4];
+        unpack_packed_to_i8(&packed, &mut out, 4);
+        assert_eq!(out, [1, 0, -1, 1]);
+    }
+
+    #[test]
+    fn unpack_multiple_bytes() {
+        // 8 weights: [+1,+1,+1,+1, -1,-1,-1,-1]
+        let packed = [0x00u8, 0xAAu8];
+        let mut out = [0i8; 8];
+        unpack_packed_to_i8(&packed, &mut out, 8);
+        assert_eq!(out, [1, 1, 1, 1, -1, -1, -1, -1]);
+    }
+
+    #[test]
+    fn unpack_with_remainder() {
+        // 3 weights from 1 byte: [+1, 0, -1]
+        let packed = [0x24u8]; // full byte is [+1, 0, -1, +1]
+        let mut out = [99i8; 4]; // extra space
+        unpack_packed_to_i8(&packed, &mut out, 3);
+        assert_eq!(&out[..3], &[1, 0, -1]);
+    }
+
+    #[test]
+    fn packed_i8_dot_basic() {
+        // weights: [+1, -1, 0, +1]
+        // v0=+1→0b00, v1=-1→0b10, v2=0→0b01, v3=+1→0b00
+        // byte = 0b00 | (0b10 << 2) | (0b01 << 4) | (0b00 << 6) = 0 | 8 | 16 | 0 = 24 = 0x18
+        let packed = [0x18u8];
+        let activation: Vec<i8> = vec![10, 20, 30, 40];
+        // dot = 1*10 + (-1)*20 + 0*30 + 1*40 = 10 - 20 + 0 + 40 = 30
+        assert_eq!(dot_packed_ternary_i8_fast(&packed, &activation, 4), 30);
+    }
+
+    #[test]
+    fn packed_i8_dot_matches_unpacked() {
+        // Create a larger test case matching against the unpacked kernel
+        let weights_i8: Vec<i8> = (0..256)
+            .map(|i| match i % 3 {
+                0 => 1,
+                1 => 0,
+                _ => -1,
+            })
+            .collect();
+        let activation: Vec<i8> = (0..256).map(|i| (i as i8).wrapping_mul(3)).collect();
+
+        // Pack weights
+        let packed: Vec<u8> = weights_i8
+            .chunks(4)
+            .map(|chunk| {
+                let encode = |v: i8| -> u8 {
+                    match v {
+                        1 => 0b00,
+                        0 => 0b01,
+                        -1 => 0b10,
+                        _ => 0b01,
+                    }
+                };
+                encode(chunk[0])
+                    | (encode(chunk[1]) << 2)
+                    | (encode(chunk[2]) << 4)
+                    | (encode(chunk[3]) << 6)
+            })
+            .collect();
+
+        let packed_result = dot_packed_ternary_i8_fast(&packed, &activation, 256);
+        let unpacked_result = dot_ternary_i8_fast(&weights_i8, &activation);
+        assert_eq!(packed_result, unpacked_result);
+    }
+
+    #[test]
+    fn packed_f32_dot_basic() {
+        // Same weight pattern as packed_i8_dot_basic
+        let packed = [0x18u8]; // [+1, -1, 0, +1]
+        let input = vec![1.5_f32, 2.5, 3.5, 4.5];
+        // dot = 1*1.5 + (-1)*2.5 + 0*3.5 + 1*4.5 = 1.5 - 2.5 + 0 + 4.5 = 3.5
+        let result = dot_packed_ternary_f32_fast(&packed, &input, 4);
+        assert!((result - 3.5).abs() < 1e-6, "expected 3.5, got {result}");
+    }
+
+    #[test]
+    fn packed_f32_dot_matches_unpacked() {
+        let weights_i8: Vec<i8> = (0..256)
+            .map(|i| match i % 3 {
+                0 => 1,
+                1 => 0,
+                _ => -1,
+            })
+            .collect();
+        let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 12.8).collect();
+
+        let packed: Vec<u8> = weights_i8
+            .chunks(4)
+            .map(|chunk| {
+                let encode = |v: i8| -> u8 {
+                    match v {
+                        1 => 0b00,
+                        0 => 0b01,
+                        -1 => 0b10,
+                        _ => 0b01,
+                    }
+                };
+                encode(chunk[0])
+                    | (encode(chunk[1]) << 2)
+                    | (encode(chunk[2]) << 4)
+                    | (encode(chunk[3]) << 6)
+            })
+            .collect();
+
+        let packed_result = dot_packed_ternary_f32_fast(&packed, &input, 256);
+        let unpacked_result = dot_ternary_f32_fast(&weights_i8, &input);
+        assert!(
+            (packed_result - unpacked_result).abs() < 1e-4,
+            "packed={packed_result} vs unpacked={unpacked_result}"
+        );
+    }
+
+    #[test]
+    fn f32_dot_product_basic() {
+        let a = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let b = vec![5.0_f32, 6.0, 7.0, 8.0];
+        // 1*5 + 2*6 + 3*7 + 4*8 = 5+12+21+32 = 70
+        let result = dot_f32_f32_fast(&a, &b);
+        assert!((result - 70.0).abs() < 1e-4, "expected 70.0, got {result}");
+    }
+
+    #[test]
+    fn f32_dot_product_large() {
+        let n = 2560; // model hidden size
+        let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..n).map(|i| 1.0 - (i as f32) * 0.0005).collect();
+
+        let simd_result = dot_f32_f32_fast(&a, &b);
+        let scalar_result: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert!(
+            (simd_result - scalar_result).abs() < scalar_result.abs() * 1e-5,
+            "simd={simd_result} vs scalar={scalar_result}"
+        );
+    }
+
+    #[test]
+    fn packed_dot_empty() {
+        assert_eq!(dot_packed_ternary_i8_fast(&[], &[], 0), 0);
+        assert!((dot_packed_ternary_f32_fast(&[], &[], 0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn packed_i8_dot_non_chunk_aligned() {
+        // Test with length not a multiple of CHUNK (256)
+        let n = 100;
+        let weights_i8: Vec<i8> = (0..n)
+            .map(|i| match i % 3 {
+                0 => 1,
+                1 => 0,
+                _ => -1,
+            })
+            .collect();
+        let activation: Vec<i8> = (0..n).map(|i| ((i * 7) % 255) as i8).collect();
+
+        let packed: Vec<u8> = weights_i8
+            .chunks(4)
+            .map(|chunk| {
+                let encode = |v: i8| -> u8 {
+                    match v {
+                        1 => 0b00,
+                        0 => 0b01,
+                        -1 => 0b10,
+                        _ => 0b01,
+                    }
+                };
+                let mut byte = encode(chunk[0]);
+                if chunk.len() > 1 {
+                    byte |= encode(chunk[1]) << 2;
+                }
+                if chunk.len() > 2 {
+                    byte |= encode(chunk[2]) << 4;
+                }
+                if chunk.len() > 3 {
+                    byte |= encode(chunk[3]) << 6;
+                }
+                byte
+            })
+            .collect();
+
+        let packed_result = dot_packed_ternary_i8_fast(&packed, &activation, n);
+        let unpacked_result = dot_ternary_i8_fast(&weights_i8, &activation);
+        assert_eq!(packed_result, unpacked_result);
     }
 }

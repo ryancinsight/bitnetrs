@@ -79,7 +79,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use tracing::{debug, instrument, trace};
 
-use bitnet_core::backend::ops::lm_head_matmul;
+use bitnet_core::backend::ops::lm_head_matmul_into;
 use bitnet_core::backend::Backend;
 use bitnet_core::config::ModelConfig;
 use bitnet_core::error::{BitNetError, Result};
@@ -346,6 +346,7 @@ struct ScratchBuffers {
     inner_normed: Vec<f32>,
     ffn_out: Vec<f32>,
     final_normed: Vec<f32>,
+    logits: Vec<f32>,
 }
 
 impl ScratchBuffers {
@@ -369,6 +370,7 @@ impl ScratchBuffers {
             inner_normed: vec![0.0_f32; ffn_dim],
             ffn_out: vec![0.0_f32; hidden_size],
             final_normed: vec![0.0_f32; hidden_size],
+            logits: vec![0.0_f32; config.vocab_size],
         }
     }
 }
@@ -822,16 +824,19 @@ impl BitNetModel {
 
         // LM head (unquantised matmul: lm_head is weight-tied to embed_tokens).
         // logits[v] = Σ_h  lm_head[v * hidden_size + h] * final_normed[h]
-        let logits = lm_head_matmul(
+        lm_head_matmul_into(
             &*final_normed,
             &*self.weights.lm_head,
+            &mut scratch.logits,
             self.config.vocab_size,
             hidden_size,
         );
 
-        debug!(vocab_size = logits.len(), "Forward pass complete");
+        debug!(vocab_size = scratch.logits.len(), "Forward pass complete");
 
-        Ok(logits)
+        // Return logits by cloning from scratch. The scratch buffer is reused
+        // on the next call, avoiding repeated allocation of the internal buffer.
+        Ok(scratch.logits.clone())
     }
 
     // ------------------------------------------------------------------
@@ -1138,8 +1143,12 @@ mod tests {
         let ones_norm = |n: usize| vec![1.0_f32; n];
 
         // All-zero ternary weights with scale=1.0.
+        // Packed format: 4 ternary values per byte.
+        // Encoding: +1→0b00, 0→0b01, -1→0b10.
+        // All-zero packed byte = 0b01_01_01_01 = 0x55.
         let zero_weight = |rows: usize, cols: usize| -> TernaryWeight {
-            TernaryWeight::new_unchecked(vec![0i8; rows * cols], 1.0, rows, cols)
+            let packed_cols = (cols + 3) / 4;
+            TernaryWeight::new_unchecked(vec![0x55u8; rows * packed_cols], 1.0, rows, cols)
         };
 
         let layer = LayerWeights {
