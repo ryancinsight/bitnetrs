@@ -459,31 +459,39 @@ pub fn dot_packed_ternary_i8_fast(packed: &[u8], activation: &[i8], n_elements: 
     debug_assert!(activation.len() >= n_elements);
     debug_assert!(packed.len() >= (n_elements + 3) / 4);
 
-    const CHUNK: usize = 256;
-    const PACKED_CHUNK: usize = CHUNK / 4; // 64
-
-    let full_chunks = n_elements / CHUNK;
-    let remainder = n_elements - full_chunks * CHUNK;
+    let full_bytes = n_elements / 4;
+    let remainder = n_elements % 4;
 
     let mut total: i32 = 0;
-    let mut unpacked = [0i8; CHUNK];
+    let decode = [1i32, 0, -1, 0]; // code → value (code 3 maps to 0 as padding)
 
-    for c in 0..full_chunks {
-        let p_off = c * PACKED_CHUNK;
-        let a_off = c * CHUNK;
-        unpack_packed_to_i8(&packed[p_off..p_off + PACKED_CHUNK], &mut unpacked, CHUNK);
-        total += dot_ternary_i8_fast(&unpacked, &activation[a_off..a_off + CHUNK]);
+    for byte_idx in 0..full_bytes {
+        let packed_byte = packed[byte_idx];
+        let act_base = byte_idx * 4;
+
+        let c0 = decode[(packed_byte & 0b11) as usize];
+        let c1 = decode[((packed_byte >> 2) & 0b11) as usize];
+        let c2 = decode[((packed_byte >> 4) & 0b11) as usize];
+        let c3 = decode[((packed_byte >> 6) & 0b11) as usize];
+
+        total += c0 * activation[act_base] as i32;
+        total += c1 * activation[act_base + 1] as i32;
+        total += c2 * activation[act_base + 2] as i32;
+        total += c3 * activation[act_base + 3] as i32;
     }
 
     if remainder > 0 {
-        let p_off = full_chunks * PACKED_CHUNK;
-        let a_off = full_chunks * CHUNK;
-        // Unpack remainder into zero-initialised buffer
-        let mut rem_buf = [0i8; CHUNK];
-        unpack_packed_to_i8(&packed[p_off..], &mut rem_buf, remainder);
-        // Scalar fallback for remainder (may not be aligned to 16)
+        let packed_byte = packed[full_bytes];
+        let act_base = full_bytes * 4;
+        let codes = [
+            decode[(packed_byte & 0b11) as usize],
+            decode[((packed_byte >> 2) & 0b11) as usize],
+            decode[((packed_byte >> 4) & 0b11) as usize],
+            decode[((packed_byte >> 6) & 0b11) as usize],
+        ];
+
         for i in 0..remainder {
-            total += rem_buf[i] as i32 * activation[a_off + i] as i32;
+            total += codes[i] * activation[act_base + i] as i32;
         }
     }
 
