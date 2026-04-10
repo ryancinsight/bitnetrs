@@ -77,9 +77,9 @@ pub mod device;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+use bitnet_cpu::simd::axpy_f32_fast;
 use tracing::{debug, instrument, trace};
 
-use bitnet_core::backend::ops::lm_head_matmul_into;
 use bitnet_core::backend::Backend;
 use bitnet_core::config::ModelConfig;
 use bitnet_core::error::{BitNetError, Result};
@@ -599,7 +599,10 @@ impl BitNetModel {
             .map(|&tok_id| {
                 let start = (tok_id as usize) * hidden_size;
                 let end = start + hidden_size;
-                self.weights.embed_tokens[start..end].to_vec()
+                self.weights.embed_tokens[start..end]
+                    .iter()
+                    .map(|&w| f32::from(w))
+                    .collect()
             })
             .collect();
 
@@ -722,10 +725,8 @@ impl BitNetModel {
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: o_proj"))?;
 
-                // ── Residual connection (attention) ────────────────────────────
-                for i in 0..hidden_size {
-                    h[i] += scratch.o_out[i];
-                }
+                // ── Residual connection (attention) ────────────────────────────────────
+                axpy_f32_fast(1.0, &scratch.o_out, h);
 
                 // ── Pre-FFN RMSNorm ────────────────────────────────────────────
                 self.backend
@@ -792,10 +793,8 @@ impl BitNetModel {
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: down_proj"))?;
 
-                // ── Residual connection (FFN) ──────────────────────────────────
-                for i in 0..hidden_size {
-                    h[i] += scratch.ffn_out[i];
-                }
+                // ── Residual connection (FFN) ──────────────────────────────────────────
+                axpy_f32_fast(1.0, &scratch.ffn_out, h);
 
                 trace!(
                     layer = layer_idx,
@@ -824,13 +823,15 @@ impl BitNetModel {
 
         // LM head (unquantised matmul: lm_head is weight-tied to embed_tokens).
         // logits[v] = Σ_h  lm_head[v * hidden_size + h] * final_normed[h]
-        lm_head_matmul_into(
-            &*final_normed,
-            &*self.weights.lm_head,
-            &mut scratch.logits,
-            self.config.vocab_size,
-            hidden_size,
-        );
+        self.backend
+            .lm_head_matmul_bf16_into(
+                final_normed,
+                &self.weights.lm_head,
+                &mut scratch.logits,
+                self.config.vocab_size,
+                hidden_size,
+            )
+            .context("lm_head_bf16")?;
 
         debug!(vocab_size = scratch.logits.len(), "Forward pass complete");
 
@@ -917,7 +918,9 @@ impl BitNetModel {
             let emb_end = emb_start + hidden_size;
             scratch
                 .h_single
-                .copy_from_slice(&self.weights.embed_tokens[emb_start..emb_end]);
+                .iter_mut()
+                .zip(self.weights.embed_tokens[emb_start..emb_end].iter())
+                .for_each(|(out, &w)| *out = f32::from(w));
 
             for layer_idx in 0..self.config.num_hidden_layers {
                 let layer = &self.weights.layers[layer_idx];
@@ -1022,10 +1025,7 @@ impl BitNetModel {
                     .with_context(|| format!("layer {layer_idx}: o_proj"))?;
 
                 // Residual (attention)
-                let h = &mut scratch.h_single;
-                for i in 0..hidden_size {
-                    h[i] += scratch.o_out[i];
-                }
+                axpy_f32_fast(1.0, &scratch.o_out, h);
 
                 // Pre-FFN RMSNorm
                 self.backend
@@ -1089,10 +1089,7 @@ impl BitNetModel {
                     .with_context(|| format!("layer {layer_idx}: down_proj"))?;
 
                 // Residual (FFN)
-                let h = &mut scratch.h_single;
-                for i in 0..hidden_size {
-                    h[i] += scratch.ffn_out[i];
-                }
+                axpy_f32_fast(1.0, &scratch.ffn_out, h);
 
                 trace!(layer = layer_idx, pos = position, "Decode layer processed");
             }
@@ -1110,13 +1107,15 @@ impl BitNetModel {
                 )
                 .context("final_norm")?;
 
-            lm_head_matmul_into(
-                &scratch.final_normed,
-                &self.weights.lm_head,
-                output_logits,
-                self.config.vocab_size,
-                hidden_size,
-            );
+            self.backend
+                .lm_head_matmul_bf16_into(
+                    &scratch.final_normed,
+                    &self.weights.lm_head,
+                    output_logits,
+                    self.config.vocab_size,
+                    hidden_size,
+                )
+                .context("lm_head_bf16")?;
 
             debug!(
                 vocab_size = output_logits.len(),
@@ -1170,6 +1169,7 @@ impl BitNetModel {
 mod tests {
     use super::*;
     use bitnet_core::config::ModelConfig;
+    use half;
 
     /// Forensic test: run one forward step with the real packed model and print
     /// intermediate values for layer 0 to diagnose forward-pass correctness.
@@ -1254,7 +1254,10 @@ mod tests {
 
         // Embedding for this token
         let embed: Vec<f32> = (0..h)
-            .map(|i| (token_id * h + i) as f32 * 0.01 - center)
+            .map(|i| {
+                let v_f32 = (token_id * h + i) as f32 * 0.01 - center;
+                f32::from(half::bf16::from_f32(v_f32))
+            })
             .collect();
 
         // RMS norm: rms = sqrt(mean(embed²) + eps)
@@ -1268,7 +1271,7 @@ mod tests {
             .map(|vi| {
                 let mut acc = 0.0_f32;
                 for hi in 0..h {
-                    let lm = (vi * h + hi) as f32 * 0.01 - center;
+                    let lm = f32::from(half::bf16::from_f32((vi * h + hi) as f32 * 0.01 - center));
                     acc += lm * embed[hi] * inv_rms;
                 }
                 acc
@@ -1455,11 +1458,14 @@ mod tests {
             .collect();
 
         use std::sync::Arc;
-        let embed_data: Vec<f32> = (0..v * h)
-            .map(|i| (i as f32 * 0.01) - (v * h / 2) as f32 * 0.01)
+        let embed_data: Vec<half::bf16> = (0..v * h)
+            .map(|i| {
+                let val = (i as f32 * 0.01) - (v * h / 2) as f32 * 0.01;
+                half::bf16::from_f32(val)
+            })
             .collect();
-        let embed_tokens: Arc<Vec<f32>> = Arc::new(embed_data);
-        let lm_head: Arc<Vec<f32>> = Arc::clone(&embed_tokens); // true weight tying
+        let embed_tokens: Arc<Vec<half::bf16>> = Arc::new(embed_data);
+        let lm_head: Arc<Vec<half::bf16>> = Arc::clone(&embed_tokens); // true weight tying
         let final_norm = ones_norm(h);
 
         ModelWeights {

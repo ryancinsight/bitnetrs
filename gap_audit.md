@@ -58,13 +58,13 @@ Each gap is classified by:
 | G30 | SSE4.1/NEON fallback for packed dot products | Low | M | Open |
 | G31 | AVX2 lm_head via Backend trait extension | Medium | M | Closed |
 | G32 | Fully fused packed SIMD kernel (inline decode + dot) | Low | M | Open |
-| G33 | f16/bf16 embedding table for lm_head bandwidth | Medium | M | Open |
+| G33 | f16/bf16 embedding table for lm_head bandwidth | Medium | M | ✅ Closed |
 | G34 | CI regression harness for tokens/sec | Low | S | Open |
 | G35 | No SSE4.1/NEON SIMD fallbacks | Medium | M | Open |
-| G36 | No fused packed SIMD kernel (decode without unpack buffer) | Medium | M | Open |
+| G36 | No fused packed SIMD kernel (decode without unpack buffer) | Medium | M | ✅ Closed |
 | G37 | KV cache layout suboptimal for GQA ([kv_heads, seq, dim]) | Medium | M | Open |
 | G38 | No mmap for weight loading (safetensors) | Medium | M | Open |
-| G39 | Per-token allocation in `rope::apply_rope` cos/sin Vecs | Low | S | Open |
+| G39 | Per-token allocation in `rope::apply_rope` cos/sin Vecs | Low | S | ✅ Closed |
 
 ---
 
@@ -777,7 +777,7 @@ Single-pass AVX2 kernel: load packed `u8` → shift/mask to extract 4 ternary va
 
 **Severity:** Medium  
 **Effort:** M  
-**Status:** Open
+**Status:** ✅ Closed
 
 **Description:**  
 The `embed_tokens` / `lm_head` weight matrix is stored as `Vec<f32>` (~1.31 GB for 128,256 × 2560). Since `lm_head` is the dominant remaining bottleneck, halving its bandwidth via f16 storage reduces per-token latency.
@@ -833,7 +833,7 @@ All SIMD kernels (`dot_f32_f32_fast`, `dot_packed_ternary_i8_fast`, `dot_packed_
 
 **Severity:** Medium  
 **Effort:** M  
-**Status:** Open
+**Status:** ✅ Closed
 
 **Description:**  
 Current packed SIMD kernels decode packed bytes to an intermediate buffer, then compute the dot product in a second pass. A fused kernel inlines the 2-bit decode within the SIMD loop body, eliminating the intermediate buffer and avoiding one pass over the weight data per dot product.
@@ -894,7 +894,7 @@ KV cache uses `[layer][seq][dim]` layout. For grouped-query attention with `n_kv
 
 **Severity:** Low  
 **Effort:** S  
-**Status:** Open
+**Status:** ✅ Closed
 
 **Description:**  
 `rope::apply_rope` allocates `Vec<f32>` for cos and sin values on each invocation. During decode, this function is called once per token per layer (30 layers), resulting in 60 small `Vec` allocations per token.
@@ -920,18 +920,18 @@ R  High  │       │ G01 G09  │  G02  │       │
 I        │       │          │  G04  │       │
 T        ├───────┼──────────┼───────┼───────┤
 I  Med   │  G13  │ G12 G29  │       │  G11  │
-C        │       │ G33 G35  │       │       │
-A        │       │ G36 G37  │       │       │
+C        │       │ G35      │       │       │
+A        │       │ G37      │       │       │
          │       │ G38      │       │       │
          ├───────┼──────────┼───────┼───────┤
 L  Low   │  G19  │ G30  G32 │  G14  │       │
          │  G34  │          │  G16  │       │
-         │  G39  │          │       │       │
+         │       │          │       │       │
          └───────┴──────────┴───────┴───────┘
 ```
 
 * G06 is **Partial** — tiny-model regression tests pass; real-weights `output.contains("Paris")` test now passes; additional diverse-prompt end-to-end tests remain.
-Closed (removed from matrix): G03, G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, G24, G25, G26, G27, G28, G31.
+Closed (removed from matrix): G03, G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, G24, G25, G26, G27, G28, G31, G33, G36, G39.
 ```
 
 ---

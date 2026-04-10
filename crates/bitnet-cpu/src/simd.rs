@@ -445,6 +445,59 @@ pub fn unpack_packed_to_i8(packed: &[u8], out: &mut [i8], n_elements: usize) {
     }
 }
 
+/// AVX2-accelerated packed ternary × i8 dot product.
+///
+/// Decodes 64 elements (16 packed bytes) at a time into a stack `[i8; 64]`
+/// buffer using `DECODE_LUT`, then calls the existing `dot_ternary_i8_avx2`
+/// kernel for each chunk. Zero heap allocation: stack buffer fits in L1.
+///
+/// # Invariant
+/// n_elements must equal activation.len() and packed.len() == (n_elements+3)/4.
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_packed_ternary_i8_avx2_chunked(
+    packed: &[u8],
+    activation: &[i8],
+    n_elements: usize,
+) -> i32 {
+    const CHUNK: usize = 64;
+    const PACKED_PER_CHUNK: usize = CHUNK / 4; // 16 packed bytes → 64 elements
+    let full_chunks = n_elements / CHUNK;
+    let remainder = n_elements % CHUNK;
+    let mut total: i32 = 0;
+    let mut stack_buf = [0i8; CHUNK];
+
+    for chunk_idx in 0..full_chunks {
+        let p_start = chunk_idx * PACKED_PER_CHUNK;
+        let a_start = chunk_idx * CHUNK;
+        unpack_packed_to_i8(
+            &packed[p_start..p_start + PACKED_PER_CHUNK],
+            &mut stack_buf,
+            CHUNK,
+        );
+        total += dot_ternary_i8_avx2(&stack_buf, &activation[a_start..a_start + CHUNK]);
+    }
+
+    if remainder > 0 {
+        let p_start = full_chunks * PACKED_PER_CHUNK;
+        let a_start = full_chunks * CHUNK;
+        let rem_packed = (remainder + 3) / 4;
+        unpack_packed_to_i8(
+            &packed[p_start..p_start + rem_packed],
+            &mut stack_buf,
+            remainder,
+        );
+        for i in 0..remainder {
+            total += (stack_buf[i] as i32) * (activation[a_start + i] as i32);
+        }
+    }
+
+    total
+}
+
 /// Packed ternary dot product: packed 2-bit weights × i8 activations → i32.
 ///
 /// # Arguments
@@ -456,6 +509,13 @@ pub fn unpack_packed_to_i8(packed: &[u8], out: &mut [i8], n_elements: usize) {
 /// 4× less memory bandwidth for weight data vs the unpacked path.
 #[inline]
 pub fn dot_packed_ternary_i8_fast(packed: &[u8], activation: &[i8], n_elements: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            return unsafe { dot_packed_ternary_i8_avx2_chunked(packed, activation, n_elements) };
+        }
+    }
     debug_assert!(activation.len() >= n_elements);
     debug_assert!(packed.len() >= (n_elements + 3) / 4);
 
@@ -498,11 +558,67 @@ pub fn dot_packed_ternary_i8_fast(packed: &[u8], activation: &[i8], n_elements: 
     total
 }
 
+/// AVX2-accelerated packed ternary × f32 dot product.
+///
+/// Decodes 32 elements (8 packed bytes) at a time into a stack `[i8; 32]`
+/// buffer, then calls `dot_ternary_f32_avx2` for each chunk.
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_packed_ternary_f32_avx2_chunked(
+    packed: &[u8],
+    input: &[f32],
+    n_elements: usize,
+) -> f32 {
+    const CHUNK: usize = 32;
+    const PACKED_PER_CHUNK: usize = CHUNK / 4; // 8 packed bytes → 32 elements
+    let full_chunks = n_elements / CHUNK;
+    let remainder = n_elements % CHUNK;
+    let mut total: f32 = 0.0;
+    let mut stack_buf = [0i8; CHUNK];
+
+    for chunk_idx in 0..full_chunks {
+        let p_start = chunk_idx * PACKED_PER_CHUNK;
+        let a_start = chunk_idx * CHUNK;
+        unpack_packed_to_i8(
+            &packed[p_start..p_start + PACKED_PER_CHUNK],
+            &mut stack_buf,
+            CHUNK,
+        );
+        total += dot_ternary_f32_avx2(&stack_buf, &input[a_start..a_start + CHUNK]);
+    }
+
+    if remainder > 0 {
+        let p_start = full_chunks * PACKED_PER_CHUNK;
+        let a_start = full_chunks * CHUNK;
+        let rem_packed = (remainder + 3) / 4;
+        unpack_packed_to_i8(
+            &packed[p_start..p_start + rem_packed],
+            &mut stack_buf,
+            remainder,
+        );
+        for i in 0..remainder {
+            total += stack_buf[i] as f32 * input[a_start + i];
+        }
+    }
+
+    total
+}
+
 /// Packed ternary dot product: packed 2-bit weights × f32 activations → f32.
 ///
 /// Same chunk-based strategy as the i8 variant.
 #[inline]
 pub fn dot_packed_ternary_f32_fast(packed: &[u8], input: &[f32], n_elements: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            return unsafe { dot_packed_ternary_f32_avx2_chunked(packed, input, n_elements) };
+        }
+    }
     debug_assert!(input.len() >= n_elements);
     debug_assert!(packed.len() >= (n_elements + 3) / 4);
 
@@ -771,6 +887,150 @@ pub fn mul_scale_f32_fast(x: &[f32], scale: f32, w: &[f32], out: &mut [f32]) {
     for i in 0..x.len() {
         out[i] = x[i] * scale * w[i];
     }
+}
+
+// ---------------------------------------------------------------------------
+// elementwise_mul: out[i] = a[i] * b[i]
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated elementwise multiply: `out[i] = a[i] * b[i]`.
+///
+/// Used in FFN gate ⊙ up: `out = gate * up` (6912 elements).
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn elementwise_mul_f32_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+
+    let len = a.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let va = _mm256_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(base));
+        let result = _mm256_mul_ps(va, vb);
+        _mm256_storeu_ps(out.as_mut_ptr().add(base), result);
+    }
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            out[base + i] = a[base + i] * b[base + i];
+        }
+    }
+}
+
+/// Elementwise multiply with automatic SIMD dispatch.
+///
+/// Computes `out[i] = a[i] * b[i]` for all i.
+#[inline]
+pub fn elementwise_mul_f32_fast(a: &[f32], b: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            unsafe { elementwise_mul_f32_avx2(a, b, out) };
+            return;
+        }
+    }
+    for i in 0..a.len() {
+        out[i] = a[i] * b[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dot_f32_bf16w: f32 hidden × bf16 weights → f32 (lm_head matmul)
+// ---------------------------------------------------------------------------
+
+/// AVX2+FMA dot product: f32 hidden × packed bf16 weights → f32.
+///
+/// BF16 → f32 conversion theorem:
+///   bf16 has the same exponent field as f32 (8 bits, same bias 127).
+///   A bf16 value stored in u16 becomes a valid f32 by placing those bits
+///   in the high 16 bits of a u32 (zero-extending the low mantissa bits).
+///   `f32_bits = (u16_bits as u32) << 16`
+///
+/// This conversion is exact for all normal and subnormal bf16 values (no
+/// rounding). No F16C instruction is required — only AVX2 + FMA.
+///
+/// Algorithm:
+///   1. Load 8 × u16 bf16 weights via `_mm_loadu_si128`.
+///   2. Zero-extend to 8 × u32 via `_mm256_cvtepu16_epi32`.
+///   3. Shift left 16 via `_mm256_slli_epi32(v, 16)` → f32 bit layout.
+///   4. Reinterpret as f32 via `_mm256_castsi256_ps`.
+///   5. Load 8 × f32 hidden; FMA: acc += weight_f32 * hidden.
+///
+/// # Safety
+/// Caller must verify AVX2 + FMA support via `has_avx2()` and `has_fma()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_f32_bf16w_avx2(weights_bf16_u16: &[u16], hidden: &[f32]) -> f32 {
+    debug_assert_eq!(weights_bf16_u16.len(), hidden.len());
+
+    let len = weights_bf16_u16.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        // Load 8 × u16 bf16 values (16 bytes = one 128-bit register).
+        let w_u16 = _mm_loadu_si128(weights_bf16_u16.as_ptr().add(base) as *const __m128i);
+        // Zero-extend u16 → u32: 8 values in 256-bit register.
+        let w_u32 = _mm256_cvtepu16_epi32(w_u16);
+        // Shift left 16 bits: places bf16 bits in the f32 exponent+mantissa field.
+        let w_f32_bits = _mm256_slli_epi32(w_u32, 16);
+        // Reinterpret integer bits as f32 (no conversion, bit-identical).
+        let w_f32 = _mm256_castsi256_ps(w_f32_bits);
+        // Load 8 f32 hidden values.
+        let h = _mm256_loadu_ps(hidden.as_ptr().add(base));
+        // FMA: acc += w_f32 * h.
+        acc = _mm256_fmadd_ps(w_f32, h, acc);
+    }
+
+    let mut result = hsum_f32_avx2(acc);
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            // Scalar bf16 → f32: same bit-shift as the AVX2 path.
+            let w_f32 = f32::from_bits((weights_bf16_u16[base + i] as u32) << 16);
+            result += w_f32 * hidden[base + i];
+        }
+    }
+
+    result
+}
+
+/// BF16-weight dot product with automatic SIMD dispatch.
+///
+/// Computes `Σ_i f32_from_bf16(weights_bf16[i]) * hidden[i]`.
+///
+/// Uses AVX2+FMA when available (no F16C needed); scalar fallback otherwise.
+///
+/// Primary use: LM-head matmul with bf16 weight storage.
+/// Halves memory bandwidth vs f32 weight storage.
+#[inline]
+pub fn dot_f32_bf16w_fast(weights_bf16_u16: &[u16], hidden: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() {
+            // Safety: AVX2+FMA availability confirmed by the checks above.
+            return unsafe { dot_f32_bf16w_avx2(weights_bf16_u16, hidden) };
+        }
+    }
+    // Scalar fallback: bf16 → f32 via bit-shift.
+    let mut acc = 0.0_f32;
+    for (&w, &h) in weights_bf16_u16.iter().zip(hidden.iter()) {
+        acc += f32::from_bits((w as u32) << 16) * h;
+    }
+    acc
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,5 +1506,272 @@ mod tests {
         let packed_result = dot_packed_ternary_i8_fast(&packed, &activation, n);
         let unpacked_result = dot_ternary_i8_fast(&weights_i8, &activation);
         assert_eq!(packed_result, unpacked_result);
+    }
+
+    // ── AVX2 chunked packed-ternary i8 tests ──────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn packed_i8_dot_avx2_chunked_matches_scalar() {
+        if !has_avx2() {
+            return;
+        }
+        // n=64: 1 full CHUNK=64, no remainder.
+        // All +1 weights: 0x00 per packed byte.
+        // activation[i] = i as i8, i in 0..64.
+        // Analytical: Σ_{i=0}^{63} i = 63·64/2 = 2016.
+        {
+            let n = 64usize;
+            let packed = vec![0x00u8; n / 4];
+            let activation: Vec<i8> = (0..n).map(|i| i as i8).collect();
+            let expected: i32 = 2016;
+            let got = unsafe { dot_packed_ternary_i8_avx2_chunked(&packed, &activation, n) };
+            assert_eq!(got, expected, "n=64 all-+1");
+        }
+        // n=128: 2 full CHUNKs, no remainder.
+        // All -1 weights: 0xAA per packed byte (0b10101010 → four -1s).
+        // activation = [1i8; 128].
+        // Analytical: 128 × (-1) × 1 = -128.
+        {
+            let n = 128usize;
+            let packed = vec![0xAAu8; n / 4];
+            let activation = vec![1i8; n];
+            let expected: i32 = -128;
+            let got = unsafe { dot_packed_ternary_i8_avx2_chunked(&packed, &activation, n) };
+            assert_eq!(got, expected, "n=128 all--1");
+        }
+        // n=2560: mixed weights cycling [+1, 0, -1].
+        // Reference: unpack then dot_ternary_i8_scalar.
+        {
+            let n = 2560usize;
+            let weights_i8: Vec<i8> = (0..n).map(|i| [1i8, 0, -1][i % 3]).collect();
+            let activation: Vec<i8> = (0..n).map(|i| ((i * 13 + 7) % 127) as i8).collect();
+            let packed: Vec<u8> = weights_i8
+                .chunks(4)
+                .map(|c| {
+                    let enc = |v: i8| -> u8 {
+                        match v {
+                            1 => 0b00,
+                            0 => 0b01,
+                            _ => 0b10,
+                        }
+                    };
+                    enc(c[0]) | (enc(c[1]) << 2) | (enc(c[2]) << 4) | (enc(c[3]) << 6)
+                })
+                .collect();
+            let mut unpacked = vec![0i8; n];
+            unpack_packed_to_i8(&packed, &mut unpacked, n);
+            let expected = dot_ternary_i8_scalar(&unpacked, &activation);
+            let got = unsafe { dot_packed_ternary_i8_avx2_chunked(&packed, &activation, n) };
+            assert_eq!(got, expected, "n=2560 mixed");
+        }
+    }
+
+    // ── AVX2 chunked packed-ternary f32 tests ─────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn packed_f32_dot_avx2_chunked_matches_scalar() {
+        if !has_avx2() {
+            return;
+        }
+        // n=32: 1 full CHUNK=32, no remainder.
+        // All +1 weights: 0x00 per packed byte.
+        // input[i] = i as f32, i in 0..32.
+        // Analytical: Σ_{i=0}^{31} i = 31·32/2 = 496.0.
+        {
+            let n = 32usize;
+            let packed = vec![0x00u8; n / 4];
+            let input: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let expected: f32 = 496.0;
+            let got = unsafe { dot_packed_ternary_f32_avx2_chunked(&packed, &input, n) };
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "n=32 all-+1: got={got}, expected={expected}"
+            );
+        }
+        // n=64: 2 full CHUNKs, no remainder.
+        // All -1 weights: 0xAA per packed byte.
+        // input = [1.0f32; 64].
+        // Analytical: 64 × (-1) × 1.0 = -64.0.
+        {
+            let n = 64usize;
+            let packed = vec![0xAAu8; n / 4];
+            let input = vec![1.0f32; n];
+            let expected: f32 = -64.0;
+            let got = unsafe { dot_packed_ternary_f32_avx2_chunked(&packed, &input, n) };
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "n=64 all--1: got={got}, expected={expected}"
+            );
+        }
+        // n=2560: mixed weights cycling [+1, 0, -1].
+        // Reference: unpack then dot_ternary_f32_scalar.
+        {
+            let n = 2560usize;
+            let weights_i8: Vec<i8> = (0..n).map(|i| [1i8, 0, -1][i % 3]).collect();
+            let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 12.8).collect();
+            let packed: Vec<u8> = weights_i8
+                .chunks(4)
+                .map(|c| {
+                    let enc = |v: i8| -> u8 {
+                        match v {
+                            1 => 0b00,
+                            0 => 0b01,
+                            _ => 0b10,
+                        }
+                    };
+                    enc(c[0]) | (enc(c[1]) << 2) | (enc(c[2]) << 4) | (enc(c[3]) << 6)
+                })
+                .collect();
+            let mut unpacked = vec![0i8; n];
+            unpack_packed_to_i8(&packed, &mut unpacked, n);
+            let expected = dot_ternary_f32_scalar(&unpacked, &input);
+            let got = unsafe { dot_packed_ternary_f32_avx2_chunked(&packed, &input, n) };
+            let tol = expected.abs() * 1e-4 + 1e-4;
+            assert!(
+                (got - expected).abs() < tol,
+                "n=2560 mixed: got={got}, expected={expected}, diff={}",
+                (got - expected).abs()
+            );
+        }
+    }
+
+    // ── elementwise_mul tests ──────────────────────────────────────────────
+
+    #[test]
+    fn elementwise_mul_basic() {
+        // a = [2, 3, 5, 7], b = [11, 13, 17, 19] (consecutive prime pairs)
+        // Analytical: out[i] = a[i]*b[i] = [22, 39, 85, 133].
+        let a = [2.0f32, 3.0, 5.0, 7.0];
+        let b = [11.0f32, 13.0, 17.0, 19.0];
+        let mut out = [0.0f32; 4];
+        elementwise_mul_f32_fast(&a, &b, &mut out);
+        assert_eq!(out, [22.0, 39.0, 85.0, 133.0]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn elementwise_mul_avx2_matches_scalar() {
+        if !has_avx2() {
+            return;
+        }
+        // n=9: 1 full AVX2 vector (8 lanes) + 1-element scalar tail.
+        // a[i] = i+1, b[i] = 1/(i+1) → out[i] = 1.0 exactly.
+        {
+            let n = 9usize;
+            let a: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
+            let b: Vec<f32> = (0..n).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+            let mut out_avx2 = vec![0.0f32; n];
+            let mut out_scalar = vec![0.0f32; n];
+            unsafe { elementwise_mul_f32_avx2(&a, &b, &mut out_avx2) };
+            for i in 0..n {
+                out_scalar[i] = a[i] * b[i];
+            }
+            for i in 0..n {
+                assert!(
+                    (out_avx2[i] - out_scalar[i]).abs() < 1e-6,
+                    "n=9 mismatch at i={i}: avx2={} scalar={}",
+                    out_avx2[i],
+                    out_scalar[i]
+                );
+            }
+        }
+        // n=6912: FFN gate ⊙ up dimension for 2B model.
+        // Both SIMD and scalar paths must produce bit-identical results.
+        {
+            let n = 6912usize;
+            let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+            let b: Vec<f32> = (0..n).map(|i| 1.0 - (i as f32) * 0.0001).collect();
+            let mut out_avx2 = vec![0.0f32; n];
+            let mut out_scalar = vec![0.0f32; n];
+            unsafe { elementwise_mul_f32_avx2(&a, &b, &mut out_avx2) };
+            for i in 0..n {
+                out_scalar[i] = a[i] * b[i];
+            }
+            for i in 0..n {
+                assert!(
+                    (out_avx2[i] - out_scalar[i]).abs() < 1e-7,
+                    "n=6912 mismatch at i={i}: avx2={} scalar={}",
+                    out_avx2[i],
+                    out_scalar[i]
+                );
+            }
+        }
+    }
+
+    // ----- dot_f32_bf16w tests -----------------------------------------
+
+    /// bf16::from_f32(1.0).to_bits() = 0x3F80.
+    /// bf16::from_f32(2.0).to_bits() = 0x4000.
+    /// dot([1.0_bf16, 2.0_bf16], [3.0_f32, 4.0_f32]) = 1.0*3.0 + 2.0*4.0 = 11.0
+    #[test]
+    fn dot_f32_bf16w_basic() {
+        // 1.0 in bf16: sign=0, exp=127=0x7F, mantissa=0 → bits = 0x3F80
+        // 2.0 in bf16: sign=0, exp=128=0x80, mantissa=0 → bits = 0x4000
+        let w: Vec<u16> = vec![0x3F80u16, 0x4000u16]; // [1.0, 2.0] in bf16
+        let h: Vec<f32> = vec![3.0_f32, 4.0_f32];
+        let result = dot_f32_bf16w_fast(&w, &h);
+        assert!(
+            (result - 11.0_f32).abs() < 1e-5,
+            "expected 11.0, got {result}"
+        );
+    }
+
+    /// For a hidden vector of size 2560 (lm_head row width), result must
+    /// match scalar computation within f32 numerical precision.
+    #[test]
+    fn dot_f32_bf16w_large_matches_scalar() {
+        let n = 2560usize;
+        // Construct bf16 weights by converting f32 → bf16 (as u16 raw bits).
+        let weights_u16: Vec<u16> = (0..n)
+            .map(|i| {
+                let v = (i as f32 * 0.001) - 1.28_f32;
+                // bf16: same as f32 but with low 16 mantissa bits zeroed.
+                let f32_bits = v.to_bits();
+                // Round mantissa to bf16 precision (round-to-nearest-even).
+                let bf16_bits = ((f32_bits + 0x7FFF + ((f32_bits >> 16) & 1)) >> 16) as u16;
+                bf16_bits
+            })
+            .collect();
+        let hidden: Vec<f32> = (0..n).map(|i| (i as f32 * 0.0005) - 0.64_f32).collect();
+
+        // Scalar reference: convert each bf16 u16 → f32 via bit shift.
+        let expected: f32 = weights_u16
+            .iter()
+            .zip(hidden.iter())
+            .map(|(&w, &h)| f32::from_bits((w as u32) << 16) * h)
+            .sum();
+
+        let got = dot_f32_bf16w_fast(&weights_u16, &hidden);
+
+        // Allow small floating-point reordering difference (max 1e-3 relative).
+        let rel_err = ((got - expected) / (expected.abs() + 1e-10)).abs();
+        assert!(
+            rel_err < 1e-3,
+            "relative error {rel_err} exceeds 1e-3: got {got}, expected {expected}"
+        );
+    }
+
+    /// All-zero bf16 weights produce zero dot product.
+    #[test]
+    fn dot_f32_bf16w_zero_weights() {
+        let n = 128usize;
+        let w = vec![0u16; n]; // 0.0 in bf16
+        let h: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        assert_eq!(dot_f32_bf16w_fast(&w, &h), 0.0_f32);
+    }
+
+    /// bf16(1.0) × f32(1.0) for n=9 (one full AVX2 chunk + 1 remainder).
+    #[test]
+    fn dot_f32_bf16w_unaligned_remainder() {
+        let n = 9usize;
+        let w = vec![0x3F80u16; n]; // 1.0 in bf16 for all
+        let h = vec![1.0_f32; n];
+        let result = dot_f32_bf16w_fast(&w, &h);
+        assert!(
+            (result - n as f32).abs() < 1e-4,
+            "expected {n}.0, got {result}"
+        );
     }
 }

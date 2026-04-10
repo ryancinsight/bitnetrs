@@ -236,8 +236,8 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 | FP-9 | Backend trait packed weights — all backends updated: `ternary_gemv` now takes `&[u8]` packed; GPU GEMV falls back to CPU (shader not yet updated) (commit f8fd086) | P0 | ✅ Done |
 | FP-10 | GPU compute shader update for packed 2-bit weights (`gemv.wgsl` rewrite for `&[u8]` packed input) | P0 | — |
 | FP-11 | AVX2 SIMD for lm_head — `lm_head_matmul_into` added to `Backend` trait with default impl; `CpuBackend` overrides with `dot_f32_f32_fast` per vocab row + Rayon parallelism; GPU/NPU backends forward to CPU; DIP-compliant | P1 | ✅ Done |
-| FP-12 | Fully fused packed SIMD kernel — inline decode + dot product without intermediate buffer | P1 | — |
-| FP-13 | f16/bf16 embedding table to reduce lm_head bandwidth (1.31 GB f32 → ~655 MB f16) | P1 | — |
+| FP-12 | Fully fused packed SIMD kernel — inline decode + dot product without intermediate buffer; stack-allocated `[i8; 64]` buffers with DECODE_LUT + `dot_ternary_i8_avx2` (zero heap allocation) | P1 | ✅ Done |
+| FP-13 | f16/bf16 embedding table to reduce lm_head bandwidth (1.31 GB f32 → ~655 MB f16); `embed_tokens` and `lm_head` fields changed from `Arc<Vec<f32>>` to `Arc<Vec<half::bf16>>` in `ModelWeights`; `lm_head_matmul_bf16_into` added to Backend trait with default Rayon+scalar and CpuBackend AVX2 override via `dot_f32_bf16w_fast` (bf16→f32 via `(u16 as u32) << 16`, no F16C needed); memory 1.31 GB → 0.655 GB; lm_head bandwidth per token 1.28 GB → 0.64 GB | P1 | ✅ Done |
 | FP-14 | CI regression harness for tokens/sec (automated performance tracking) | P1 | — |
 | FP-15 | Zero-copy forward pass — `BitNetModel::forward_into` writes logits directly into caller buffer (eliminates ~500 KiB clone per token); decode path uses `ScratchBuffers::h_single` pre-allocated instead of `Vec<Vec<f32>>`; `InferenceEngine` pre-allocates `logits_buf: Vec<f32>` | P1 | ✅ Done |
 | FP-16 | SIMD attention — dot product uses `dot_f32_f32_fast` (AVX2+FMA), value accumulation uses `axpy_f32_fast` (AVX2+FMA); ~8× throughput for score computation and value accumulation | P1 | ✅ Done |
@@ -247,6 +247,10 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 | FP-20 | KV cache layout optimisation `[kv_heads, seq, dim]` for GQA-friendly memory access patterns | P2 | — |
 | FP-21 | mmap for safetensors weight loading — avoid full read+copy, map file pages on demand | P2 | — |
 | FP-22 | HTTP streaming API / SSE endpoint — OpenAI-compatible `/v1/chat/completions` with `text/event-stream` | P2 | — |
+| FP-23 | SIMD elementwise_mul — `elementwise_mul_f32_avx2` / `elementwise_mul_f32_fast` (AVX2 8-wide multiply, gate⊙up 6912 elements per layer) | P1 | ✅ Done |
+| FP-24 | SIMD residual adds — all 4 scalar `for i in 0..hidden_size { h[i] += scratch.*..[i] }` loops replaced with `axpy_f32_fast(1.0, src, dst)` (AVX2+FMA 8-wide) | P1 | ✅ Done |
+| FP-25 | RoPE allocation elimination (G39) — `Mutex<Option<RopeCache>>` in `CpuBackend`; lazy-init on first call; uses `apply_rope_cached`; eliminates 60 × `Vec<f32>` allocations per decode token | P1 | ✅ Done |
+| FP-26 | BF16 lm_head matmul backend method — `Backend::lm_head_matmul_bf16_into` with default Rayon+scalar and CpuBackend AVX2 SIMD override | P1 | ✅ Done |
 
 ---
 

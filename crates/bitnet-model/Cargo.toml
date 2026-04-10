@@ -14,6 +14,7 @@ bitnet-npu.workspace     = true
 bitnet-weights.workspace = true
 anyhow.workspace         = true
 tracing.workspace        = true
+half.workspace           = true
 
 [dev-dependencies]
 bitnet-convert.workspace = true

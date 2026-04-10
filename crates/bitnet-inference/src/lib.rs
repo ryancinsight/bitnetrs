@@ -2080,8 +2080,9 @@ mod tests {
         // Check embedding magnitudes for first token.
         let hidden_size = engine.model.config().hidden_size;
         let embed_start = (tokens[0] as usize) * hidden_size;
-        let embed_slice =
+        let embed_slice_bf16 =
             &engine.model.weights().embed_tokens[embed_start..embed_start + hidden_size];
+        let embed_slice: Vec<f32> = embed_slice_bf16.iter().map(|&w| f32::from(w)).collect();
         let embed_rms: f32 =
             (embed_slice.iter().map(|x| x * x).sum::<f32>() / hidden_size as f32).sqrt();
         let embed_max: f32 = embed_slice.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
@@ -2205,14 +2206,17 @@ mod tests {
         // ── Step 1: BOS embedding ──────────────────────────────────────────
         let bos_id = 128000_u32;
         let start = (bos_id as usize) * hidden_size;
-        let bos_emb = &weights.embed_tokens[start..start + hidden_size];
+        let bos_emb: Vec<f32> = weights.embed_tokens[start..start + hidden_size]
+            .iter()
+            .map(|&w| f32::from(w))
+            .collect();
         eprintln!("BOS embedding first 5: {:?}", &bos_emb[..5]);
 
         // ── Step 2: RMSNorm ────────────────────────────────────────────────
         let layer = &weights.layers[0];
         let mut h_norm = vec![0.0_f32; hidden_size];
         backend
-            .rms_norm(bos_emb, &layer.attention_norm, eps, &mut h_norm)
+            .rms_norm(&bos_emb, &layer.attention_norm, eps, &mut h_norm)
             .expect("rms_norm must succeed on layer 0");
         eprintln!("After RMSNorm first 5: {:?}", &h_norm[..5]);
 

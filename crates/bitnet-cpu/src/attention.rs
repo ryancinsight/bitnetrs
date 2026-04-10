@@ -125,7 +125,7 @@ pub fn masked_attention(
     }
 
     let seq_len = cur_pos + 1; // number of positions in cache
-    let head_stride = seq_len * head_dim; // elements per KV head in cache
+    let head_stride = k_cache.len() / n_kv_heads; // elements per KV head in fixed-capacity cache
     let required_cache = n_kv_heads * head_stride;
 
     let q_expected = n_heads * head_dim;
@@ -145,6 +145,12 @@ pub fn masked_attention(
         return Err(BitNetError::shape(
             format!("v_cache.len() >= {required_cache}"),
             format!("v_cache.len() = {}", v_cache.len()),
+        ));
+    }
+    if head_stride < seq_len * head_dim {
+        return Err(BitNetError::shape(
+            format!("per-head cache stride >= {}", seq_len * head_dim),
+            format!("per-head cache stride = {head_stride}"),
         ));
     }
     if output.len() != q_expected {

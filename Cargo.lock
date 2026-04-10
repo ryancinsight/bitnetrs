@@ -227,6 +227,7 @@ dependencies = [
  "anyhow",
  "bitnet-core",
  "bytemuck",
+ "half",
  "rayon",
  "thiserror 2.0.18",
  "tracing",
@@ -275,6 +276,7 @@ dependencies = [
  "bitnet-gpu",
  "bitnet-npu",
  "bitnet-weights",
+ "half",
  "tracing",
 ]
 

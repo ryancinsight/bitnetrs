@@ -3,6 +3,10 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Architecture: BitNet b1.58](https://img.shields.io/badge/model-BitNet%20b1.58%202B-green.svg)](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
+[![Original: microsoft/BitNet](https://img.shields.io/badge/original-microsoft%2FBitNet-0078d4?logo=github)](https://github.com/microsoft/BitNet)
+
+> **Based on [microsoft/BitNet](https://github.com/microsoft/BitNet)** — the official C++ inference framework for 1-bit LLMs by Microsoft Research.
+> This project is an independent Rust reimplementation of the BitNet b1.58 architecture and is not affiliated with or endorsed by Microsoft.
 
 A complete, production-quality Rust reimplementation of Microsoft's **BitNet b1.58** — the first open-source, native 1-bit Large Language Model at the 2-billion parameter scale.
 
@@ -12,6 +16,7 @@ Supports **CPU**, **GPU** (via `wgpu`: Vulkan / Metal / DX12), and **NPU** (Wind
 
 ## Table of Contents
 
+- [Acknowledgements](#acknowledgements)
 - [Architecture Overview](#architecture-overview)
 - [Quick Start](#quick-start)
 - [Building](#building)
@@ -24,6 +29,21 @@ Supports **CPU**, **GPU** (via `wgpu`: Vulkan / Metal / DX12), and **NPU** (Wind
 - [Mathematical Foundation](#mathematical-foundation)
 - [Device Support](#device-support)
 - [License](#license)
+
+---
+
+## Acknowledgements
+
+This project is a Rust reimplementation of **Microsoft's BitNet b1.58**, built on the research and reference implementations published by Microsoft Research.
+
+| Original work | Link |
+|---|---|
+| **microsoft/BitNet** — Official C++ inference engine | <https://github.com/microsoft/BitNet> |
+| **BitNet b1.58 2B4T Technical Report** (Wang et al., 2025) | <https://arxiv.org/abs/2504.12285> |
+| **The Era of 1-bit LLMs** (Ma et al., 2024) | <https://arxiv.org/abs/2402.17764> |
+| **bitnet-b1.58-2B-4T** — Model weights on HuggingFace | <https://huggingface.co/microsoft/bitnet-b1.58-2B-4T> |
+
+The ternary quantisation scheme (AbsMean, W2A8), the model architecture (GQA, squared-ReLU FFN, sub-layer norms), and the packed-weight format implemented here follow the specifications and reference code published in the above works. All credit for the original research and C++ implementation belongs to the authors at Microsoft Research.
 
 ---
 
@@ -284,9 +304,9 @@ The following benchmarks are based on the official BitNet b1.58 technical report
 | Component | Size |
 |-----------|------|
 | Ternary weights (non-embedding) | **~400 MB** |
-| Embedding table | ~1.3 GB (f32) |
+| Embedding table (BF16) | **~655 MB** (down from 1.3 GB f32) |
 | KV cache (4096 ctx) | ~600 MB (f32) |
-| Total working set | ~2.3 GB |
+| Total working set | **~1.65 GB** |
 
 ---
 
@@ -464,11 +484,11 @@ MIT License — see [LICENSE](LICENSE).
 
 ## References
 
-- [BitNet b1.58 2B4T Technical Report](https://arxiv.org/abs/2504.12285) (April 2025)
-- [The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764) (February 2024)
-- [microsoft/BitNet](https://github.com/microsoft/BitNet) — Official C++ inference framework
-- [microsoft/bitnet-b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) — Model weights
-- [LLaMA 3](https://ai.meta.com/blog/meta-llama-3/) — Tokenizer architecture
+- Wang, S. et al. **BitNet b1.58 2B4T Technical Report** (April 2025). <https://arxiv.org/abs/2504.12285>
+- Ma, S. et al. **The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits** (February 2024). <https://arxiv.org/abs/2402.17764>
+- **microsoft/BitNet** — Official C++ inference framework for 1-bit LLMs. <https://github.com/microsoft/BitNet>
+- **microsoft/bitnet-b1.58-2B-4T** — Pre-trained model weights on HuggingFace. <https://huggingface.co/microsoft/bitnet-b1.58-2B-4T>
+- **LLaMA 3** — Tokenizer architecture (Meta AI). <https://ai.meta.com/blog/meta-llama-3/>
 
 ---
 

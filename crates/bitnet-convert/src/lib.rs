@@ -444,11 +444,16 @@ pub fn convert_hf_packed_to_canonical(
     let kv_rows = config.num_key_value_heads * config.head_dim();
     let ffn_rows = config.intermediate_size;
 
-    let embed_tokens = Arc::new(load_float_tensor(
-        &model.tensors,
-        "model.embed_tokens.weight",
-        config.vocab_size * hidden,
-    )?);
+    let embed_tokens = Arc::new(
+        load_float_tensor(
+            &model.tensors,
+            "model.embed_tokens.weight",
+            config.vocab_size * hidden,
+        )?
+        .iter()
+        .map(|&x| half::bf16::from_f32(x))
+        .collect::<Vec<half::bf16>>(),
+    );
 
     let final_norm = load_float_tensor(&model.tensors, "model.norm.weight", hidden)?;
 
@@ -898,12 +903,16 @@ mod tests {
     #[test]
     fn runtime_packed_model_wraps_canonical() {
         let cfg = bitnet_2b_config();
+        let embed_tokens = Arc::new(vec![
+            half::bf16::from_f32(0.0);
+            cfg.vocab_size * cfg.hidden_size
+        ]);
         let weights = ModelWeights {
             config: cfg.clone(),
-            embed_tokens: Arc::new(vec![0.0; cfg.vocab_size * cfg.hidden_size]),
+            embed_tokens: Arc::clone(&embed_tokens),
             layers: Vec::new(),
             final_norm: vec![1.0; cfg.hidden_size],
-            lm_head: Arc::new(vec![0.0; cfg.vocab_size * cfg.hidden_size]),
+            lm_head: embed_tokens,
         };
         let canonical = CanonicalModelWeights { weights };
         let runtime = convert_canonical_to_runtime(canonical.clone());

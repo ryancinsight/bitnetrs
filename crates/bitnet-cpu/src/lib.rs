@@ -67,13 +67,16 @@ use tracing::instrument;
 ///
 /// `CpuBackend` is `Send + Sync` and can be wrapped in `Arc<dyn Backend>` for
 /// shared use across multiple inference threads or async tasks.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CpuBackend {
     /// Human-readable name reported by [`Backend::device_name`].
     name: String,
     /// Number of Rayon threads used for parallel operations.
     /// `0` means "use Rayon's default (all logical cores)".
     threads: usize,
+    /// Lazily-initialised RoPE cos/sin cache, keyed by `(head_dim, theta, max_seq)`.
+    /// Reinitialised on the first call and whenever the configuration changes.
+    rope_cache: std::sync::Mutex<Option<rope::RopeCache>>,
 }
 
 impl CpuBackend {
@@ -125,6 +128,7 @@ impl CpuBackend {
         Ok(Self {
             name: format!("CPU ({actual_threads} threads)"),
             threads: actual_threads,
+            rope_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -292,7 +296,21 @@ impl Backend for CpuBackend {
         n_kv_heads: usize,
         theta: f32,
     ) -> Result<()> {
-        rope::apply_rope(q, k, position, head_dim, n_heads, n_kv_heads, theta)
+        let mut guard = self.rope_cache.lock().expect("rope_cache mutex poisoned");
+        let needs_reinit = match guard.as_ref() {
+            None => true,
+            Some(c) => {
+                c.head_dim != head_dim
+                    || (c.theta - theta).abs() > 1e-3_f32
+                    || position >= c.max_seq
+            }
+        };
+        if needs_reinit {
+            let max_seq = (position + 1).max(4096);
+            *guard = Some(rope::RopeCache::new(max_seq, head_dim, theta)?);
+        }
+        let cache = guard.as_ref().unwrap();
+        rope::apply_rope_cached(q, k, position, n_heads, n_kv_heads, cache)
     }
 
     // ------------------------------------------------------------------
@@ -388,9 +406,7 @@ impl Backend for CpuBackend {
                 format!("a.len() = {}", a.len()),
             ));
         }
-        for i in 0..a.len() {
-            out[i] = a[i] * b[i];
-        }
+        simd::elementwise_mul_f32_fast(a, b, out);
         Ok(())
     }
 
@@ -419,6 +435,36 @@ impl Backend for CpuBackend {
             let row_start = v * hidden_size;
             let row = &weights[row_start..row_start + hidden_size];
             *out_elem = simd::dot_f32_f32_fast(row, hidden);
+        });
+        Ok(())
+    }
+
+    /// LM-head BF16 matmul with AVX2+FMA SIMD and Rayon parallelism.
+    ///
+    /// Converts bf16 weights → f32 on the fly via `dot_f32_bf16w_fast`
+    /// (AVX2: zero-extend u16 → u32, shift left 16, fmadd; no F16C needed).
+    fn lm_head_matmul_bf16_into(
+        &self,
+        hidden: &[f32],
+        weights_bf16: &[half::bf16],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> bitnet_core::error::Result<()> {
+        use bytemuck::cast_slice;
+        use rayon::prelude::*;
+
+        debug_assert_eq!(hidden.len(), hidden_size);
+        debug_assert_eq!(weights_bf16.len(), vocab_size * hidden_size);
+        debug_assert_eq!(output.len(), vocab_size);
+
+        // Cast bf16 slice to u16 slice (bytemuck: same bits, zero-copy).
+        let weights_u16 = cast_slice::<half::bf16, u16>(weights_bf16);
+
+        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
+            let row_start = v * hidden_size;
+            let row = &weights_u16[row_start..row_start + hidden_size];
+            *out_elem = simd::dot_f32_bf16w_fast(row, hidden);
         });
         Ok(())
     }

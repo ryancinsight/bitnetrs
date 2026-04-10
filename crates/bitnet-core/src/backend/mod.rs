@@ -277,19 +277,23 @@ pub trait Backend: Send + Sync + 'static {
     /// output = concat(attn[0], ..., attn[n_heads-1])
     /// ```
     ///
-    /// The KV cache is stored in head-major order to improve temporal locality
-    /// during autoregressive decode:
+    /// The KV cache is stored in fixed-capacity head-major order to improve
+    /// temporal locality during autoregressive decode:
     ///
     /// ```text
     /// cache[kv_h, t, d] = cache[
-    ///     kv_h * ((cur_pos + 1) * head_dim) + t * head_dim + d
+    ///     kv_h * (max_seq * head_dim) + t * head_dim + d
     /// ]
     /// ```
     ///
+    /// where `max_seq` is the cache capacity for the current inference session.
+    /// Only positions `t ∈ 0..=cur_pos` are logically valid; later positions in
+    /// the backing buffer are reserved capacity and must be ignored.
+    ///
     /// # Shapes
     /// - `q`:       `[n_heads × head_dim]`
-    /// - `k_cache`: `[n_kv_heads × (cur_pos+1) × head_dim]` head-major
-    /// - `v_cache`: `[n_kv_heads × (cur_pos+1) × head_dim]` head-major
+    /// - `k_cache`: `[n_kv_heads × max_seq × head_dim]` head-major backing storage
+    /// - `v_cache`: `[n_kv_heads × max_seq × head_dim]` head-major backing storage
     /// - `output`:  `[n_heads × head_dim]` — pre-allocated, overwritten.
     ///
     /// # Errors
@@ -374,6 +378,44 @@ pub trait Backend: Send + Sync + 'static {
         hidden_size: usize,
     ) -> Result<()> {
         crate::backend::ops::lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size);
+        Ok(())
+    }
+
+    /// LM-head matrix–vector multiply with BF16 weight storage.
+    ///
+    /// Computes `output[v] = dot(lm_head_bf16[v*hidden_size..], hidden)` for each
+    /// vocabulary entry `v`, using bf16-stored weights to halve memory bandwidth.
+    ///
+    /// # BF16 → f32 conversion
+    /// BF16 is a subset of f32 with 7 mantissa bits (vs 23). Conversion is exact
+    /// for all normal values: `f32_bits = (bf16_bits as u32) << 16`.
+    ///
+    /// # Default implementation
+    /// Uses Rayon for parallelism (one row per task) with scalar bf16→f32 conversion.
+    /// The CPU backend overrides with AVX2+FMA.
+    ///
+    /// # Errors
+    /// Returns `Err` on shape mismatch.
+    fn lm_head_matmul_bf16_into(
+        &self,
+        hidden: &[f32],
+        weights_bf16: &[half::bf16],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        debug_assert_eq!(hidden.len(), hidden_size);
+        debug_assert_eq!(weights_bf16.len(), vocab_size * hidden_size);
+        debug_assert_eq!(output.len(), vocab_size);
+        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
+            let row = &weights_bf16[v * hidden_size..(v + 1) * hidden_size];
+            let mut acc = 0.0_f32;
+            for (&w, &h_val) in row.iter().zip(hidden.iter()) {
+                acc += f32::from(w) * h_val;
+            }
+            *out_elem = acc;
+        });
         Ok(())
     }
 
@@ -486,6 +528,17 @@ impl Backend for Arc<dyn Backend> {
         hidden_size: usize,
     ) -> Result<()> {
         (**self).lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size)
+    }
+
+    fn lm_head_matmul_bf16_into(
+        &self,
+        hidden: &[f32],
+        weights_bf16: &[half::bf16],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        (**self).lm_head_matmul_bf16_into(hidden, weights_bf16, output, vocab_size, hidden_size)
     }
 
     fn device_name(&self) -> &str {

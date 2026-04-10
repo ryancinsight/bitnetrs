@@ -242,11 +242,14 @@ pub struct ModelWeights {
     /// Model configuration (dimensions, head counts, etc.)
     pub config: ModelConfig,
 
-    /// Token embedding table.  Shape: `[vocab_size, hidden_size]`, row-major.
+    /// Token embedding table stored as bfloat16 to halve memory bandwidth.
+    /// Shape: `[vocab_size, hidden_size]`, row-major.
     ///
     /// `embed_tokens[token_id * hidden_size .. (token_id+1) * hidden_size]`
     /// gives the embedding vector for `token_id`.
-    pub embed_tokens: Arc<Vec<f32>>,
+    ///
+    /// Embedding lookup: convert row from bf16 → f32 on-the-fly (exact, zero-cost per token).
+    pub embed_tokens: Arc<Vec<half::bf16>>,
 
     /// Per-layer weights.  Length == `config.num_hidden_layers`.
     pub layers: Vec<LayerWeights>,
@@ -255,12 +258,13 @@ pub struct ModelWeights {
     /// Shape: `[hidden_size]`.
     pub final_norm: Vec<f32>,
 
-    /// Language model head weight (tied to `embed_tokens`).
+    /// Language model head weight (weight-tied to `embed_tokens`, shared Arc).
+    /// Shape: `[vocab_size, hidden_size]`.
+    /// BF16 storage halves lm-head matmul memory bandwidth per token.
     ///
     /// Shared Arc with `embed_tokens` — no extra allocation.
-    /// Shape: `[vocab_size, hidden_size]`.
     /// Semantics: `logits[v] = dot(lm_head[v], hidden)`.
-    pub lm_head: Arc<Vec<f32>>,
+    pub lm_head: Arc<Vec<half::bf16>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +350,7 @@ pub fn load_weights_from_bf16(
 
     // ── Step 2: Load global tensors ────────────────────────────────────────
 
-    // embed_tokens: [vocab_size, hidden_size]
+    // embed_tokens: [vocab_size, hidden_size] — stored as bf16 to halve memory footprint
     let embed_tokens = Arc::new(
         require_tensor(
             &tensor_map,
@@ -354,7 +358,9 @@ pub fn load_weights_from_bf16(
             config.vocab_size * config.hidden_size,
         )
         .context("Failed to load embed_tokens")?
-        .to_vec(),
+        .iter()
+        .map(|&x| half::bf16::from_f32(x))
+        .collect::<Vec<half::bf16>>(),
     );
 
     debug!(n_elements = embed_tokens.len(), "embed_tokens loaded");
@@ -597,8 +603,48 @@ pub fn load_weights_from_packed(
 
     // ── Global tensors ─────────────────────────────────────────────────────
 
+    // Helper: load embed_tokens directly as Vec<bf16> to halve memory footprint.
+    // Supports BF16, F16, and F32 source dtypes — all downconvert to bf16.
+    let get_embed_as_bf16 = |key: &str, expected_elems: usize| -> anyhow::Result<Vec<half::bf16>> {
+        let (bytes, shape, dtype) = raw_map.get(key).ok_or_else(|| {
+            anyhow!(
+                "Required tensor '{}' not found (total tensors: {})",
+                key,
+                raw_map.len()
+            )
+        })?;
+        let n_elems: usize = shape.iter().product::<usize>().max(1);
+        if n_elems != expected_elems {
+            return Err(anyhow!(
+                "Tensor '{}' has {} elements, expected {}",
+                key,
+                n_elems,
+                expected_elems
+            ));
+        }
+        let bf16_vals: Vec<half::bf16> = match dtype.as_str() {
+            "BF16" => bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+            "F16" => bytes
+                .chunks_exact(2)
+                .map(|c| {
+                    let f32_val = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                    half::bf16::from_f32(f32_val)
+                })
+                .collect(),
+            "F32" => bytes
+                .chunks_exact(4)
+                .map(|c| half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect(),
+            other => return Err(anyhow!("Unexpected dtype '{}' for embed_tokens", other)),
+        };
+        Ok(bf16_vals)
+    };
+
     let embed_tokens = Arc::new(
-        get_bf16_f32(
+        get_embed_as_bf16(
             "model.embed_tokens.weight",
             config.vocab_size * config.hidden_size,
         )
@@ -1239,7 +1285,11 @@ mod tests {
         let config = tiny_config();
         let weights = write_and_load(&config).unwrap();
         for (i, &v) in weights.embed_tokens.iter().enumerate() {
-            assert!(v.is_finite(), "embed_tokens[{i}] = {v} is not finite");
+            assert!(
+                f32::from(v).is_finite(),
+                "embed_tokens[{i}] = {:?} is not finite",
+                v
+            );
         }
     }
 
@@ -1465,8 +1515,9 @@ mod tests {
         let weights = write_and_load(&config).unwrap();
         for (i, &v) in weights.embed_tokens.iter().enumerate() {
             assert!(
-                v.abs() < 1000.0,
-                "embed_tokens[{i}] = {v} outside reasonable range"
+                f32::from(v).abs() < 1000.0,
+                "embed_tokens[{i}] = {:?} outside reasonable range",
+                v
             );
         }
     }
@@ -1543,8 +1594,11 @@ mod tests {
             (60704, "Paris(60704)"),
             (17, "2(17)"),
         ] {
-            let row = &emb[tok_id * h..(tok_id + 1) * h];
-            describe_vec(row, label);
+            let row_f32: Vec<f32> = emb[tok_id * h..(tok_id + 1) * h]
+                .iter()
+                .map(|&x| f32::from(x))
+                .collect();
+            describe_vec(&row_f32, label);
         }
 
         // ── All layer-0 scale values ──
@@ -1571,7 +1625,11 @@ mod tests {
         }
         // Embedding values should be finite and reasonable.
         for &v in &emb[..10] {
-            assert!(v.is_finite(), "embedding value must be finite, got {v}");
+            assert!(
+                f32::from(v).is_finite(),
+                "embedding value must be finite, got {:?}",
+                v
+            );
         }
     }
 
@@ -1816,8 +1874,11 @@ mod tests {
         let emb = &weights.embed_tokens;
         let h = config.hidden_size;
         let first_row = &emb[..h];
-        let mean: f32 = first_row.iter().sum::<f32>() / h as f32;
-        let max_abs = first_row.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let mean: f32 = first_row.iter().map(|&x| f32::from(x)).sum::<f32>() / h as f32;
+        let max_abs = first_row
+            .iter()
+            .map(|&x| f32::from(x).abs())
+            .fold(0.0_f32, f32::max);
         eprintln!("embed_tokens[0] mean={mean:.6}  max_abs={max_abs:.6}");
         assert!(
             max_abs > 0.0 && max_abs.is_finite(),
