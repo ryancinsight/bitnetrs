@@ -203,7 +203,7 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 | ID | Story | Priority | Status |
 |----|-------|----------|--------|
 | F1-0 | LM head `Arc<Vec<f32>>` weight tying — eliminates ~1.3 GB embedding duplication (G10) | P0 | ✅ Done |
-| F1-1 | SIMD acceleration for CPU GEMV (AVX2 / NEON) | P1 | — |
+| F1-1 | SIMD acceleration for CPU GEMV (AVX2 / NEON) | P1 | ✅ Done |
 | F1-2 | Persistent GPU buffers (avoid re-upload per forward call) | P0 | — |
 | F1-3 | Fused Q+K+V projection (single GEMV for wqkv) | P1 | — |
 | F1-4 | Speculative decoding (draft model acceleration) | P2 | — |
@@ -212,9 +212,25 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 | F1-7 | Batched inference (multiple prompts simultaneously) | P1 | — |
 | F1-8 | Quantised embedding (U8) to reduce embedding table memory | P2 | — |
 | F1-9 | Rayon work-stealing tuning for heterogeneous core counts | P2 | — |
+| F1-13 | Rayon-parallel `lm_head_matmul` (128K vocab rows via `par_chunks`) | P1 | ✅ Done |
+| F1-14 | Rayon-parallel attention heads (20 heads via `par_chunks_mut`) | P1 | ✅ Done |
+| F1-15 | Persistent model scratch buffers (`ScratchBuffers` struct) | P1 | ✅ Done |
+| F1-16 | O(1) incremental token context in decode loop | P1 | ✅ Done |
+| F1-17 | Pre-allocated activation quantisation buffer (`absmax_quantize_row_into`) | P1 | ✅ Done |
 | F1-10 | KV cache overflow enforcement against `max_seq` | P0 | ✅ Done |
 | F1-11 | NPU detection keyword expansion: Samsung/MediaTek/APU + `BITNET_NPU_ADAPTER` env var override (G07) | P1 | ✅ Done |
 | F1-12 | Activation quantisation (absmax i8) in forward-pass GEMV — required for quality output | P0 | — |
+
+### Future Performance — Remaining Opportunities
+
+| ID | Story | Priority | Status |
+|----|-------|----------|--------|
+| FP-1 | 2-bit packed weight storage (4× less memory bandwidth, ~2× speedup potential) | P1 | — |
+| FP-2 | SSE4.1 fallback SIMD path for pre-AVX2 CPUs | P2 | — |
+| FP-3 | GPU inference via wgpu compute shaders (persistent buffers, see G02) | P0 | — |
+| FP-4 | KV cache quantisation (fp16 or int8) | P2 | — |
+
+---
 
 ### F2 — Additional Model Variants
 

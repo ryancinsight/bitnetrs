@@ -135,7 +135,7 @@ pub fn ternary_gemv_f32(
         .for_each(|(row_idx, out_elem)| {
             let row_start = row_idx * in_features;
             let row = &weight[row_start..row_start + in_features];
-            *out_elem = dot_ternary_f32(row, input) * weight_scale;
+            *out_elem = super::simd::dot_ternary_f32_fast(row, input) * weight_scale;
         });
 
     Ok(())
@@ -273,7 +273,7 @@ pub fn ternary_gemv_quantised(
         .for_each(|(row_idx, out_elem)| {
             let row_start = row_idx * in_features;
             let row = &weight[row_start..row_start + in_features];
-            let acc = dot_ternary_i8(row, activation);
+            let acc = super::simd::dot_ternary_i8_fast(row, activation);
             *out_elem = acc as f32 * combined_scale;
         });
 

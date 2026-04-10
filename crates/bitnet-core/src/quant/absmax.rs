@@ -109,6 +109,61 @@ pub fn absmax_quantize_row(x: &[f32]) -> Result<(Vec<i8>, f32)> {
     Ok((quantised, scale))
 }
 
+/// Quantise a single token's activation vector into a pre-allocated buffer.
+///
+/// Same semantics as [`absmax_quantize_row`] but writes into `out` instead
+/// of allocating a new `Vec<i8>`. Returns the per-token scale.
+///
+/// # Arguments
+/// - `x`:   Input activation vector (must be non-empty, all values finite).
+/// - `out`: Pre-allocated output buffer (must have `out.len() == x.len()`).
+///
+/// # Returns
+/// The per-token scale `α_x = max(|x|) / 127`.
+///
+/// # Errors
+/// - [`BitNetError::QuantizationError`] if `x` is empty, contains non-finite values,
+///   or `out.len() != x.len()`.
+pub fn absmax_quantize_row_into(x: &[f32], out: &mut [i8]) -> Result<f32> {
+    if x.is_empty() {
+        return Err(BitNetError::quant(
+            "cannot quantise an empty activation vector",
+        ));
+    }
+    if out.len() != x.len() {
+        return Err(BitNetError::quant(format!(
+            "output buffer length {} != input length {}",
+            out.len(),
+            x.len()
+        )));
+    }
+
+    // Find max(|x|) while checking for non-finite values.
+    let mut max_abs = 0.0_f32;
+    for (i, &v) in x.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(BitNetError::quant(format!(
+                "non-finite activation value at index {i}: {v}"
+            )));
+        }
+        let abs_v = v.abs();
+        if abs_v > max_abs {
+            max_abs = abs_v;
+        }
+    }
+
+    let max_abs_clamped = max_abs.max(ABSMAX_MIN);
+    let scale = max_abs_clamped / Q8_MAX;
+    let inv_scale = Q8_MAX / max_abs_clamped;
+
+    for (o, &v) in out.iter_mut().zip(x.iter()) {
+        let scaled = (v * inv_scale).round();
+        *o = scaled.clamp(-128.0, 127.0) as i8;
+    }
+
+    Ok(scale)
+}
+
 // ---------------------------------------------------------------------------
 // Dequantisation
 // ---------------------------------------------------------------------------

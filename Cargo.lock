@@ -214,6 +214,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "rayon",
  "serde",
  "thiserror 2.0.18",
  "tracing",

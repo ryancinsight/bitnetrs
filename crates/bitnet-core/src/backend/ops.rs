@@ -46,6 +46,8 @@
 //! out_i = max(0, x_i)²
 //! ```
 
+use rayon::prelude::*;
+
 // ---------------------------------------------------------------------------
 // RMSNorm
 // ---------------------------------------------------------------------------
@@ -295,15 +297,18 @@ pub fn lm_head_matmul(
     debug_assert_eq!(weights.len(), vocab_size * hidden_size);
 
     let mut logits = vec![0.0_f32; vocab_size];
-    for v in 0..vocab_size {
-        let row_start = v * hidden_size;
-        let row = &weights[row_start..row_start + hidden_size];
-        let mut acc = 0.0_f32;
-        for h in 0..hidden_size {
-            acc += row[h] * hidden[h];
-        }
-        logits[v] = acc;
-    }
+    logits
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(v, out_elem)| {
+            let row_start = v * hidden_size;
+            let row = &weights[row_start..row_start + hidden_size];
+            let mut acc = 0.0_f32;
+            for h in 0..hidden_size {
+                acc += row[h] * hidden[h];
+            }
+            *out_elem = acc;
+        });
     logits
 }
 

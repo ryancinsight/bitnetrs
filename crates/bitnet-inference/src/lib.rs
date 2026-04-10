@@ -598,14 +598,16 @@ impl InferenceEngine {
 
         debug!(prefill_tokens = tokens.len(), "Prefill complete");
 
-        // Autoregressive decode loop.
-        let mut generated: Vec<u32> = Vec::with_capacity(sampling.max_new_tokens);
+        // Maintain a single growing token buffer instead of rebuilding every step.
+        let prompt_len = tokens.len();
+        let mut all_tokens = tokens; // take ownership, avoid clone
+        all_tokens.reserve(sampling.max_new_tokens);
+
         let eos_eot = self.tokenizer.eos_token_id(); // 128009 <|eot_id|>
         let eos_eot_text = 128_001_u32; // <|end_of_text|>
 
         for step in 0..sampling.max_new_tokens {
-            // Sample next token.
-            let all_tokens: Vec<u32> = tokens.iter().chain(generated.iter()).cloned().collect();
+            // Sample next token from the accumulated context.
             let next_token = sample_next_token(&mut logits, sampling, &all_tokens);
 
             if next_token == eos_eot || next_token == eos_eot_text {
@@ -617,7 +619,7 @@ impl InferenceEngine {
                 break;
             }
 
-            generated.push(next_token);
+            all_tokens.push(next_token);
             debug!(step, token = next_token, "Generated token");
 
             // Decode step: forward pass for the single new token.
@@ -628,11 +630,11 @@ impl InferenceEngine {
                 .with_context(|| format!("Decode forward pass failed at step {step}"))?;
         }
 
-        debug!(n_generated = generated.len(), "Generation complete");
+        debug!(n_generated = all_tokens.len() - prompt_len, "Generation complete");
 
-        // Decode generated tokens to text.
+        // Decode only the generated tokens (after the prompt) to text.
         self.tokenizer
-            .decode(&generated)
+            .decode(&all_tokens[prompt_len..])
             .context("Failed to decode generated tokens")
     }
 

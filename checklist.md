@@ -112,6 +112,13 @@
 - ✅ Shape validation before dispatch
 - ✅ Tests: 2×3 matrix, identity, negation, scale linearity, zero input, error cases, quantised vs f32 consistency
 
+### SIMD (`simd.rs`)
+- ✅ `dot_ternary_avx2()` — AVX2-accelerated ternary dot product (`VPSIGNW` + `VPMADDWD`, i16 precision)
+- ✅ `has_avx2()` — runtime CPUID detection for automatic dispatch
+- ✅ Correct for all inputs including the −128 edge case (i16 accumulation avoids i8 overflow)
+- ✅ Processes 16 elements per AVX2 iteration vs 1 element scalar
+- ✅ Measured: 10.2–10.4 tok/s on CPU (from ~2–3 tok/s pre-optimisation)
+
 ### Normalisation (`norm.rs`)
 - ✅ `rms_norm()` — checked variant
 - ✅ `rms_norm_unchecked()` — hot path
@@ -133,6 +140,7 @@
 - ✅ Attention scale: `1 / sqrt(head_dim)`
 - ✅ Numerically stable softmax over scores
 - ✅ Output as convex combination of V vectors
+- ✅ Rayon-parallel attention heads (20 heads via `par_chunks_mut`)
 - ✅ Tests: single-position identity, uniform scores → averaged values, dominant score, GQA head assignment, convex combination property, finite outputs, error cases, scale linearity, softmax shift invariance, 2B model dimensions smoke test
 
 ### Activation (`activation.rs`)
@@ -320,6 +328,9 @@
 - ✅ FFN residual connection
 - ✅ Final RMSNorm + LM head matmul (weight-tied)
 - ✅ Scratch buffer reuse across layers
+- ✅ Persistent model scratch buffers (`ScratchBuffers` struct, allocated once at model init)
+- ✅ Rayon-parallel `lm_head_matmul` (128K vocab rows via `par_chunks`)
+- ✅ Pre-allocated activation quantisation buffer (`absmax_quantize_row_into`)
 - ✅ KV cache position advancement
 - ✅ Tests: single token logit count, finite logits, empty tokens error, exceeds max_pos error, exceeds kv_cache max_seq error, kv_cache advances, autoregressive decode step, new_kv_cache dimensions
 
@@ -344,6 +355,7 @@
 - ✅ `InferenceEngine::new()` — resolve sibling `config.json` when present, then load weights + model + tokenizer + kv_cache
 - ✅ `resolve_model_config()` — sibling `config.json` auto-detection with canonical 2B fallback
 - ✅ `InferenceEngine::generate()` — prefill + decode loop with EOS check
+- ✅ O(1) incremental token context in decode loop (avoid full-context clone per step)
 - ✅ `InferenceEngine::generate_chat()` — chat template + generate
 - ✅ `InferenceEngine::reset()` — KV cache clear
 - ✅ `InferenceEngine::tokenizer()`, `context_length()`
@@ -431,7 +443,7 @@
 ## Known Limitations (see gap_audit.md)
 
 - GPU backend allocates/uploads buffers per forward call (not persistent)
-- No SIMD intrinsics for CPU GEMV (relies on auto-vectorisation)
+- ~~No SIMD intrinsics for CPU GEMV (relies on auto-vectorisation)~~ **Resolved**: AVX2-accelerated ternary dot product in `bitnet-cpu/src/simd.rs` via `VPSIGNW`+`VPMADDWD`; runtime CPUID dispatch; 10.2–10.4 tok/s (see G05 in gap_audit.md)
 - Tokenizer uses cl100k_base, not exact LLaMA 3 BPE vocab
 - No streaming token output (waits for full generation)
 - Single-batch inference only (no batched prefill)

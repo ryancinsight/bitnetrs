@@ -324,6 +324,56 @@ impl std::fmt::Debug for KVCache {
 }
 
 // ---------------------------------------------------------------------------
+// ScratchBuffers
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated scratch buffers for the forward pass.
+///
+/// Allocated once during model construction and reused on every `forward()` call.
+/// Eliminates ~130 KiB of heap allocation per generated token.
+struct ScratchBuffers {
+    h_norm: Vec<f32>,
+    q_buf: Vec<f32>,
+    k_buf: Vec<f32>,
+    v_buf: Vec<f32>,
+    attn_out: Vec<f32>,
+    attn_normed: Vec<f32>,
+    o_out: Vec<f32>,
+    ffn_h_norm: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    inner: Vec<f32>,
+    inner_normed: Vec<f32>,
+    ffn_out: Vec<f32>,
+    final_normed: Vec<f32>,
+}
+
+impl ScratchBuffers {
+    fn new(config: &ModelConfig) -> Self {
+        let hidden_size = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim();
+        let kv_dim = config.num_key_value_heads * config.head_dim();
+        let ffn_dim = config.intermediate_size;
+        Self {
+            h_norm: vec![0.0_f32; hidden_size],
+            q_buf: vec![0.0_f32; q_dim],
+            k_buf: vec![0.0_f32; kv_dim],
+            v_buf: vec![0.0_f32; kv_dim],
+            attn_out: vec![0.0_f32; q_dim],
+            attn_normed: vec![0.0_f32; q_dim],
+            o_out: vec![0.0_f32; hidden_size],
+            ffn_h_norm: vec![0.0_f32; hidden_size],
+            gate: vec![0.0_f32; ffn_dim],
+            up: vec![0.0_f32; ffn_dim],
+            inner: vec![0.0_f32; ffn_dim],
+            inner_normed: vec![0.0_f32; ffn_dim],
+            ffn_out: vec![0.0_f32; hidden_size],
+            final_normed: vec![0.0_f32; hidden_size],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BitNetModel
 // ---------------------------------------------------------------------------
 
@@ -363,6 +413,8 @@ pub struct BitNetModel {
     weights: ModelWeights,
     /// The compute backend (CPU / GPU / NPU).
     backend: Arc<dyn Backend>,
+    /// Pre-allocated scratch buffers reused across forward calls.
+    scratch: ScratchBuffers,
 }
 
 impl std::fmt::Debug for BitNetModel {
@@ -410,10 +462,12 @@ impl BitNetModel {
             "BitNetModel created"
         );
 
+        let scratch = ScratchBuffers::new(&weights.config);
         Ok(Self {
             config: weights.config.clone(),
             weights,
             backend,
+            scratch,
         })
     }
 
@@ -545,20 +599,8 @@ impl BitNetModel {
 
         // ── Step 2: Transformer layers ────────────────────────────────────────
 
-        // Reusable scratch buffers (allocated once, reused per layer per token).
-        let mut h_norm = vec![0.0_f32; hidden_size];
-        let mut q_buf = vec![0.0_f32; q_dim];
-        let mut k_buf = vec![0.0_f32; kv_dim];
-        let mut v_buf = vec![0.0_f32; kv_dim];
-        let mut attn_out = vec![0.0_f32; q_dim];
-        let mut attn_normed = vec![0.0_f32; q_dim];
-        let mut o_out = vec![0.0_f32; hidden_size];
-        let mut ffn_h_norm = vec![0.0_f32; hidden_size];
-        let mut gate = vec![0.0_f32; ffn_dim];
-        let mut up = vec![0.0_f32; ffn_dim];
-        let mut inner = vec![0.0_f32; ffn_dim];
-        let mut inner_normed = vec![0.0_f32; ffn_dim];
-        let mut ffn_out = vec![0.0_f32; hidden_size];
+        // Reuse persistent scratch buffers (allocated once in BitNetModel::new).
+        let scratch = &mut self.scratch;
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer: &LayerWeights = &self.weights.layers[layer_idx];
@@ -569,7 +611,7 @@ impl BitNetModel {
 
                 // ── Pre-attention RMSNorm ────────────────────────────────────
                 self.backend
-                    .rms_norm(h, &layer.attention_norm, eps, &mut h_norm)
+                    .rms_norm(h, &layer.attention_norm, eps, &mut scratch.h_norm)
                     .with_context(|| {
                         format!("layer {layer_idx}, tok {tok_offset}: attention_norm")
                     })?;
@@ -579,8 +621,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.q_proj.data,
                         layer.q_proj.scale,
-                        &h_norm,
-                        &mut q_buf,
+                        &scratch.h_norm,
+                        &mut scratch.q_buf,
                         q_dim,
                         hidden_size,
                     )
@@ -591,8 +633,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.k_proj.data,
                         layer.k_proj.scale,
-                        &h_norm,
-                        &mut k_buf,
+                        &scratch.h_norm,
+                        &mut scratch.k_buf,
                         kv_dim,
                         hidden_size,
                     )
@@ -603,8 +645,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.v_proj.data,
                         layer.v_proj.scale,
-                        &h_norm,
-                        &mut v_buf,
+                        &scratch.h_norm,
+                        &mut scratch.v_buf,
                         kv_dim,
                         hidden_size,
                     )
@@ -613,13 +655,19 @@ impl BitNetModel {
                 // ── Rotary Position Embedding ─────────────────────────────────
                 self.backend
                     .rope_embed(
-                        &mut q_buf, &mut k_buf, position, head_dim, n_heads, n_kv_heads, rope_theta,
+                        &mut scratch.q_buf,
+                        &mut scratch.k_buf,
+                        position,
+                        head_dim,
+                        n_heads,
+                        n_kv_heads,
+                        rope_theta,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: rope_embed"))?;
 
                 // ── Store K, V in cache ───────────────────────────────────────
                 kv_cache
-                    .store_kv(layer_idx, position, &k_buf, &v_buf)
+                    .store_kv(layer_idx, position, &scratch.k_buf, &scratch.v_buf)
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: store_kv"))?;
 
                 // ── Causal Attention ──────────────────────────────────────────
@@ -634,10 +682,10 @@ impl BitNetModel {
 
                 self.backend
                     .masked_attention(
-                        &q_buf,
+                        &scratch.q_buf,
                         k_cache_slice,
                         v_cache_slice,
-                        &mut attn_out,
+                        &mut scratch.attn_out,
                         n_heads,
                         n_kv_heads,
                         head_dim,
@@ -650,7 +698,12 @@ impl BitNetModel {
                 // ── Attention sub-layer norm ───────────────────────────────────
                 // Applied to [n_heads * head_dim] = [q_dim] output.
                 self.backend
-                    .rms_norm(&attn_out, &layer.attn_sub_norm, eps, &mut attn_normed)
+                    .rms_norm(
+                        &scratch.attn_out,
+                        &layer.attn_sub_norm,
+                        eps,
+                        &mut scratch.attn_normed,
+                    )
                     .with_context(|| {
                         format!("layer {layer_idx}, tok {tok_offset}: attn_sub_norm")
                     })?;
@@ -660,8 +713,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.o_proj.data,
                         layer.o_proj.scale,
-                        &attn_normed,
-                        &mut o_out,
+                        &scratch.attn_normed,
+                        &mut scratch.o_out,
                         hidden_size,
                         q_dim,
                     )
@@ -669,12 +722,12 @@ impl BitNetModel {
 
                 // ── Residual connection (attention) ────────────────────────────
                 for i in 0..hidden_size {
-                    h[i] += o_out[i];
+                    h[i] += scratch.o_out[i];
                 }
 
                 // ── Pre-FFN RMSNorm ────────────────────────────────────────────
                 self.backend
-                    .rms_norm(h, &layer.ffn_norm, eps, &mut ffn_h_norm)
+                    .rms_norm(h, &layer.ffn_norm, eps, &mut scratch.ffn_h_norm)
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: ffn_norm"))?;
 
                 // ── Gate projection ────────────────────────────────────────────
@@ -682,8 +735,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.gate_proj.data,
                         layer.gate_proj.scale,
-                        &ffn_h_norm,
-                        &mut gate,
+                        &scratch.ffn_h_norm,
+                        &mut scratch.gate,
                         ffn_dim,
                         hidden_size,
                     )
@@ -694,26 +747,33 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.up_proj.data,
                         layer.up_proj.scale,
-                        &ffn_h_norm,
-                        &mut up,
+                        &scratch.ffn_h_norm,
+                        &mut scratch.up,
                         ffn_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: up_proj"))?;
 
                 // ── Squared ReLU activation on gate ────────────────────────────
-                self.backend.squared_relu(&mut gate).with_context(|| {
-                    format!("layer {layer_idx}, tok {tok_offset}: squared_relu")
-                })?;
+                self.backend
+                    .squared_relu(&mut scratch.gate)
+                    .with_context(|| {
+                        format!("layer {layer_idx}, tok {tok_offset}: squared_relu")
+                    })?;
 
                 // ── Gate ⊙ up (element-wise multiply) ─────────────────────────
                 self.backend
-                    .elementwise_mul(&gate, &up, &mut inner)
+                    .elementwise_mul(&scratch.gate, &scratch.up, &mut scratch.inner)
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: gate * up"))?;
 
                 // ── FFN sub-layer norm ─────────────────────────────────────────
                 self.backend
-                    .rms_norm(&inner, &layer.ffn_sub_norm, eps, &mut inner_normed)
+                    .rms_norm(
+                        &scratch.inner,
+                        &layer.ffn_sub_norm,
+                        eps,
+                        &mut scratch.inner_normed,
+                    )
                     .with_context(|| {
                         format!("layer {layer_idx}, tok {tok_offset}: ffn_sub_norm")
                     })?;
@@ -723,8 +783,8 @@ impl BitNetModel {
                     .ternary_gemv_with_activation_quant(
                         &layer.down_proj.data,
                         layer.down_proj.scale,
-                        &inner_normed,
-                        &mut ffn_out,
+                        &scratch.inner_normed,
+                        &mut scratch.ffn_out,
                         hidden_size,
                         ffn_dim,
                     )
@@ -732,7 +792,7 @@ impl BitNetModel {
 
                 // ── Residual connection (FFN) ──────────────────────────────────
                 for i in 0..hidden_size {
-                    h[i] += ffn_out[i];
+                    h[i] += scratch.ffn_out[i];
                 }
 
                 trace!(
@@ -755,15 +815,15 @@ impl BitNetModel {
         let last_h = &hidden_states[seq_len - 1];
 
         // Final RMSNorm.
-        let mut final_normed = vec![0.0_f32; hidden_size];
+        let final_normed = &mut scratch.final_normed;
         self.backend
-            .rms_norm(last_h, &self.weights.final_norm, eps, &mut final_normed)
+            .rms_norm(last_h, &self.weights.final_norm, eps, final_normed)
             .context("final_norm")?;
 
         // LM head (unquantised matmul: lm_head is weight-tied to embed_tokens).
         // logits[v] = Σ_h  lm_head[v * hidden_size + h] * final_normed[h]
         let logits = lm_head_matmul(
-            &final_normed,
+            &*final_normed,
             &*self.weights.lm_head,
             self.config.vocab_size,
             hidden_size,

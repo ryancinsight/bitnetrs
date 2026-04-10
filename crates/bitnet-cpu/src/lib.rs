@@ -35,7 +35,7 @@
 //!   by the caller and passed as `&mut [f32]`).
 //! - All operations are deterministic for a fixed input.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
@@ -44,6 +44,8 @@ pub mod attention;
 pub mod gemv;
 pub mod norm;
 pub mod rope;
+#[allow(unsafe_code)]
+pub mod simd;
 
 use std::sync::Arc;
 

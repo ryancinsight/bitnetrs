@@ -13,3 +13,4 @@ tracing.workspace   = true
 bytemuck.workspace  = true
 serde.workspace     = true
 half.workspace      = true
+rayon.workspace     = true
