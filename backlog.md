@@ -235,10 +235,18 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 | FP-8 | lm_head scratch buffer — `lm_head_matmul_into` writes to pre-allocated buffer; logits buffer in `ScratchBuffers` (commit f8fd086) | P1 | ✅ Done |
 | FP-9 | Backend trait packed weights — all backends updated: `ternary_gemv` now takes `&[u8]` packed; GPU GEMV falls back to CPU (shader not yet updated) (commit f8fd086) | P0 | ✅ Done |
 | FP-10 | GPU compute shader update for packed 2-bit weights (`gemv.wgsl` rewrite for `&[u8]` packed input) | P0 | — |
-| FP-11 | AVX2 SIMD for lm_head — add `lm_head` to `Backend` trait so `CpuBackend` can use its SIMD kernels (DIP-compliant; currently auto-vectorised because `bitnet-core` cannot call `bitnet-cpu` SIMD) | P1 | — |
+| FP-11 | AVX2 SIMD for lm_head — `lm_head_matmul_into` added to `Backend` trait with default impl; `CpuBackend` overrides with `dot_f32_f32_fast` per vocab row + Rayon parallelism; GPU/NPU backends forward to CPU; DIP-compliant | P1 | ✅ Done |
 | FP-12 | Fully fused packed SIMD kernel — inline decode + dot product without intermediate buffer | P1 | — |
 | FP-13 | f16/bf16 embedding table to reduce lm_head bandwidth (1.31 GB f32 → ~655 MB f16) | P1 | — |
 | FP-14 | CI regression harness for tokens/sec (automated performance tracking) | P1 | — |
+| FP-15 | Zero-copy forward pass — `BitNetModel::forward_into` writes logits directly into caller buffer (eliminates ~500 KiB clone per token); decode path uses `ScratchBuffers::h_single` pre-allocated instead of `Vec<Vec<f32>>`; `InferenceEngine` pre-allocates `logits_buf: Vec<f32>` | P1 | ✅ Done |
+| FP-16 | SIMD attention — dot product uses `dot_f32_f32_fast` (AVX2+FMA), value accumulation uses `axpy_f32_fast` (AVX2+FMA); ~8× throughput for score computation and value accumulation | P1 | ✅ Done |
+| FP-17 | SIMD RMSNorm — sum-of-squares uses `sum_squares_f32_fast` (AVX2+FMA), output pass uses `mul_scale_f32_fast` (AVX2); ~8× throughput for normalization | P1 | ✅ Done |
+| FP-18 | Thread-local activation quantisation scratch — `CpuBackend::ternary_gemv_with_activation_quant` uses `QUANT_SCRATCH` thread-local `RefCell<Vec<i8>>` with `absmax_quantize_row_into`; eliminates 210 × `Vec<i8>` allocations per token (~540 KB/token) | P1 | ✅ Done |
+| FP-19 | Streaming inference — `generate_streaming`/`generate_chat_streaming`/`chat_streaming` with per-token callback + `ControlFlow` early-stop; CLI uses streaming real-time output | P1 | ✅ Done |
+| FP-20 | KV cache layout optimisation `[kv_heads, seq, dim]` for GQA-friendly memory access patterns | P2 | — |
+| FP-21 | mmap for safetensors weight loading — avoid full read+copy, map file pages on demand | P2 | — |
+| FP-22 | HTTP streaming API / SSE endpoint — OpenAI-compatible `/v1/chat/completions` with `text/event-stream` | P2 | — |
 
 ---
 
@@ -256,7 +264,7 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 
 | ID | Story | Priority | Status |
 |----|-------|----------|--------|
-| F3-1 | Streaming token output (tokio channel per token) | P1 | — |
+| F3-1 | Streaming token output — `InferenceEngine::generate_streaming`, `generate_chat_streaming`, `ChatPipeline::chat_streaming` with per-token callback + `ControlFlow` early-stop; CLI `run_generate`/`run_chat` use streaming with real-time output; token count is actual generated count | P1 | ✅ Done |
 | F3-2 | Server mode: HTTP API (OpenAI-compatible /v1/chat/completions) | P1 | — |
 | F3-3 | Beam search sampling | P2 | — |
 | F3-4 | Constrained generation (grammar / JSON schema) | P2 | — |

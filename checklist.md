@@ -453,15 +453,53 @@
 
 ---
 
+## Phase 12 — Performance & Streaming
+
+### Streaming Inference
+- ✅ `InferenceEngine::generate_streaming()` — per-token callback with `ControlFlow` early-stop
+- ✅ `InferenceEngine::generate_chat_streaming()` — chat template + streaming generate
+- ✅ `ChatPipeline::chat_streaming()` — stateful multi-turn streaming
+- ✅ CLI `run_generate` uses streaming with real-time per-token output
+- ✅ CLI `run_chat` uses streaming with real-time per-token output
+- ✅ Token count is actual generated token count (not word count)
+
+### Zero-Copy Forward Pass
+- ✅ `BitNetModel::forward_into()` — writes logits directly into caller buffer (eliminates ~500 KiB clone per token)
+- ✅ Decode path uses `ScratchBuffers::h_single` (pre-allocated) instead of `Vec<Vec<f32>>` allocation
+- ✅ `InferenceEngine` pre-allocated `logits_buf: Vec<f32>` for decode loop
+
+### Thread-Local Activation Quantisation Scratch
+- ✅ `CpuBackend::ternary_gemv_with_activation_quant` uses `QUANT_SCRATCH` thread-local `RefCell<Vec<i8>>`
+- ✅ `absmax_quantize_row_into` writes into caller-provided buffer
+- ✅ Eliminates 210 × `Vec<i8>` allocations per token (~540 KB/token)
+
+### SIMD Attention
+- ✅ Attention dot product uses `dot_f32_f32_fast` (AVX2+FMA)
+- ✅ Value accumulation uses `axpy_f32_fast` (AVX2+FMA)
+- ✅ ~8× throughput improvement for score computation and value accumulation
+
+### SIMD RMSNorm
+- ✅ Sum-of-squares uses `sum_squares_f32_fast` (AVX2+FMA)
+- ✅ Output pass uses `mul_scale_f32_fast` (AVX2)
+- ✅ ~8× throughput improvement for normalization
+
+### SIMD lm_head via Backend Trait
+- ✅ `lm_head_matmul_into` added to `Backend` trait with default impl delegating to `ops::lm_head_matmul_into`
+- ✅ `CpuBackend::lm_head_matmul_into` overrides default with `dot_f32_f32_fast` per vocabulary row + Rayon parallelism
+- ✅ GPU/NPU backends updated to forward to CPU
+- ✅ DIP-compliant: `bitnet-core` defines abstraction, `bitnet-cpu` provides SIMD implementation
+
+---
+
 ## Known Limitations (see gap_audit.md)
 
 - GPU backend allocates/uploads buffers per forward call (not persistent)
 - GPU GEMV shader (`gemv.wgsl`) not yet updated for packed 2-bit weights — falls back to CPU (see G29 in gap_audit.md)
 - ~~No SIMD intrinsics for CPU GEMV (relies on auto-vectorisation)~~ **Resolved**: AVX2-accelerated ternary dot product in `bitnet-cpu/src/simd.rs` via `VPSIGNW`+`VPMADDWD`; runtime CPUID dispatch; 10.2–10.4 tok/s (see G05 in gap_audit.md). **Phase 2** (commit f8fd086): packed 2-bit SIMD kernels, sampling buffers, attention pre-alloc, lm_head scratch — 4× ternary bandwidth reduction; ~20 tok/s theoretical target
-- lm_head remains the primary bottleneck: 1.31 GB f32 weights, no SIMD from `bitnet-cpu` due to DIP boundary (solution: add `lm_head` to `Backend` trait so `CpuBackend` can use its SIMD kernels; see G31 in gap_audit.md)
+- ~~lm_head remains the primary bottleneck: 1.31 GB f32 weights, no SIMD from `bitnet-cpu` due to DIP boundary~~ **Resolved**: `lm_head_matmul_into` added to `Backend` trait; `CpuBackend` overrides with `dot_f32_f32_fast` (AVX2+FMA) per vocab row + Rayon parallelism (see G31 in gap_audit.md)
 - No SSE4.1/NEON fallback for packed dot products — AVX2-only (see G30 in gap_audit.md)
 - Tokenizer uses cl100k_base, not exact LLaMA 3 BPE vocab
-- No streaming token output (waits for full generation)
+- ~~No streaming token output (waits for full generation)~~ **Resolved**: `generate_streaming`, `generate_chat_streaming`, `chat_streaming` with per-token callback + `ControlFlow` early-stop; CLI uses streaming with real-time output (see G03 in gap_audit.md)
 - Single-batch inference only (no batched prefill)
 - NPU detection covers Intel/AMD/Qualcomm/Apple/Samsung/MediaTek; Snapdragon `"Adreno"` adapters without an `"npu"` substring may still require the `BITNET_NPU_ADAPTER` env-var override
 - Model config auto-detects from sibling `config.json`; fallback remains canonical 2B when absent

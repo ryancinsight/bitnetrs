@@ -28,7 +28,7 @@ Each gap is classified by:
 |----|------|----------|--------|--------|
 | G01 | Tokenizer vocab mismatch (cl100k_base vs LLaMA 3) | High | M | Open |
 | G02 | GPU persistent buffers (per-call allocation) | High | L | Open |
-| G03 | No streaming token output | Medium | M | Open |
+| G03 | No streaming token output | Medium | M | Closed |
 | G04 | No batched inference | Medium | L | Open |
 | G05 | CPU GEMV lacks SIMD intrinsics | Medium | L | Closed |
 | G06 | No golden output regression tests | Critical | M | Partial |
@@ -56,10 +56,15 @@ Each gap is classified by:
 | G28 | Backend trait packed weight support (&[u8] packed GEMV) | Medium | M | Closed |
 | G29 | GPU compute shader for packed 2-bit weights | Medium | M | Open |
 | G30 | SSE4.1/NEON fallback for packed dot products | Low | M | Open |
-| G31 | AVX2 lm_head via Backend trait extension | Medium | M | Open |
+| G31 | AVX2 lm_head via Backend trait extension | Medium | M | Closed |
 | G32 | Fully fused packed SIMD kernel (inline decode + dot) | Low | M | Open |
 | G33 | f16/bf16 embedding table for lm_head bandwidth | Medium | M | Open |
 | G34 | CI regression harness for tokens/sec | Low | S | Open |
+| G35 | No SSE4.1/NEON SIMD fallbacks | Medium | M | Open |
+| G36 | No fused packed SIMD kernel (decode without unpack buffer) | Medium | M | Open |
+| G37 | KV cache layout suboptimal for GQA ([kv_heads, seq, dim]) | Medium | M | Open |
+| G38 | No mmap for weight loading (safetensors) | Medium | M | Open |
+| G39 | Per-token allocation in `rope::apply_rope` cos/sin Vecs | Low | S | Open |
 
 ---
 
@@ -128,7 +133,7 @@ The current design allocates per-operation buffers for simplicity. A production 
 
 **Severity:** Medium  
 **Effort:** M  
-**Status:** Open
+**Status:** ✅ Closed
 
 **Description:**  
 `InferenceEngine::generate` and `ChatPipeline::chat` accumulate all generated tokens and return the complete string at once. Users see no output until generation is complete.
@@ -137,11 +142,14 @@ The current design allocates per-operation buffers for simplicity. A production 
 - Poor user experience for long responses (may wait 30+ seconds with no feedback).
 - Cannot implement real-time streaming APIs.
 
-**Proposed Fix:**  
-1. Add `InferenceEngine::generate_streaming(&mut self, prompt, sampling) -> impl Stream<Item = anyhow::Result<String>>`.
-2. Use `tokio::sync::mpsc::channel` to send decoded tokens as they are produced.
-3. Update `ChatPipeline::chat_streaming` similarly.
-4. CLI `chat` command should print each token as it arrives.
+**Resolution:**  
+Implemented via per-token callback + `ControlFlow` early-stop pattern (no async dependency required):
+
+1. `InferenceEngine::generate_streaming(&mut self, prompt, sampling, callback)` — invokes `callback(&str) -> ControlFlow<()>` after each decoded token; `ControlFlow::Break` stops generation early.
+2. `InferenceEngine::generate_chat_streaming(&mut self, messages, sampling, callback)` — chat-template variant with same callback pattern.
+3. `ChatPipeline::chat_streaming(&mut self, user_msg, sampling, callback)` — stateful multi-turn streaming.
+4. CLI `run_generate` and `run_chat` updated to use streaming with real-time per-token `print!` + `stdout().flush()`.
+5. Token count in timing report now reflects actual generated token count (not word count).
 
 ---
 
@@ -730,7 +738,7 @@ The packed SIMD kernels (G24) require AVX2+FMA. Pre-Haswell x86 CPUs and all ARM
 
 **Severity:** Medium  
 **Effort:** M  
-**Status:** Open
+**Status:** ✅ Closed
 
 **Description:**  
 `lm_head_matmul_into` in `bitnet-core` computes f32×f32 dot products for 128,256 vocab rows. It cannot call `dot_f32_f32_avx2` from `bitnet-cpu` due to DIP (parent modules define abstractions; child modules provide implementations). The `lm_head` operation is not part of the `Backend` trait.
@@ -739,11 +747,11 @@ The packed SIMD kernels (G24) require AVX2+FMA. Pre-Haswell x86 CPUs and all ARM
 - `lm_head` remains auto-vectorised, not explicitly SIMD-accelerated.
 - `lm_head` is the dominant remaining bottleneck (~1.31 GB f32 weight matrix).
 
-**Proposed Fix:**  
-1. Add `lm_head_matmul_into` to the `Backend` trait.
-2. `CpuBackend` implementation dispatches to `dot_f32_f32_avx2` per row.
-3. `GpuBackend` can later dispatch to a GPU shader for this operation.
-4. Preserves DIP: `bitnet-core` defines the abstraction, `bitnet-cpu` provides the implementation.
+**Resolution:**  
+1. `lm_head_matmul_into` added to `Backend` trait with default impl delegating to `ops::lm_head_matmul_into`.
+2. `CpuBackend::lm_head_matmul_into` overrides default: dispatches `dot_f32_f32_fast` (AVX2+FMA) per vocabulary row + Rayon parallelism.
+3. `GpuBackend` and `NpuBackend` updated to forward to CPU (pending GPU shader).
+4. DIP preserved: `bitnet-core` defines the trait abstraction, `bitnet-cpu` provides the SIMD implementation.
 
 ---
 
@@ -801,6 +809,106 @@ No automated regression tracking for inference throughput. Performance regressio
 
 ---
 
+### G35 — No SSE4.1/NEON SIMD Fallbacks
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+All SIMD kernels (`dot_f32_f32_fast`, `dot_packed_ternary_i8_fast`, `dot_packed_ternary_f32_fast`, `sum_squares_f32_fast`, `mul_scale_f32_fast`, `axpy_f32_fast`) require AVX2+FMA. Pre-Haswell x86 CPUs and all ARM64 targets (Apple Silicon, Graviton) fall back to scalar code for all operations — ternary GEMV, lm_head, attention, and RMSNorm.
+
+**Impact:**  
+- ARM64 gets no SIMD benefit from any kernel.
+- Pre-2013 x86 CPUs fall back to scalar for all hot paths.
+
+**Proposed Fix:**  
+1. SSE4.1 fallback kernels for all SIMD functions.
+2. NEON 128-bit kernels for ARM64 (`VMLA`, `VFMA`, `VADD`).
+3. Runtime dispatch chain: AVX2+FMA → SSE4.1 → NEON → scalar.
+
+---
+
+### G36 — No Fused Packed SIMD Kernel
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+Current packed SIMD kernels decode packed bytes to an intermediate buffer, then compute the dot product in a second pass. A fused kernel inlines the 2-bit decode within the SIMD loop body, eliminating the intermediate buffer and avoiding one pass over the weight data per dot product.
+
+**Impact:**  
+- Eliminates one full pass over weight data per ternary dot product.
+- Potential 10–20% additional speedup for ternary GEMV.
+- Removes per-call unpack buffer requirement.
+
+**Proposed Fix:**  
+Single-pass AVX2 kernel: load packed `u8` → shift/mask to extract 4 ternary values → sign-extend to i16 → `VPMADDWD` with activation → horizontal accumulate. No intermediate buffer.
+
+---
+
+### G37 — KV Cache Layout Suboptimal for GQA
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+KV cache uses `[layer][seq][dim]` layout. For grouped-query attention with `n_kv_heads < n_heads`, a `[kv_heads, seq, head_dim]` layout would provide contiguous per-head slices, improving cache locality during attention score computation and value accumulation.
+
+**Impact:**  
+- Current layout requires stride arithmetic to access per-head KV slices.
+- Suboptimal L1/L2 cache utilization during attention, particularly for long sequences.
+
+**Proposed Fix:**  
+1. Restructure KV cache to `[n_kv_heads, max_seq, head_dim]` layout.
+2. `store_kv` writes directly to the head-major position.
+3. `k_slice` / `v_slice` return contiguous `&[f32]` per head without stride computation.
+4. Validate numerical equivalence against current layout.
+
+---
+
+### G38 — No mmap for Weight Loading
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+`load_bf16_safetensors` reads the entire safetensors file into a heap-allocated `Vec<u8>`, then parses and converts to `f32`. For the 2B model (~4.3 GB on disk), this requires ~4.3 GB transient heap allocation before the converted weights are stored.
+
+**Impact:**  
+- Peak memory during loading is ~2× the final weight footprint.
+- Slower startup due to full file read before any processing can begin.
+
+**Proposed Fix:**  
+1. Memory-map the safetensors file via `memmap2` crate.
+2. Parse header from the mapped region.
+3. Convert bf16→f32 directly from the mapped slice, streaming per-tensor.
+4. Eliminates the transient `Vec<u8>` allocation entirely.
+
+---
+
+### G39 — Per-Token Allocation in `rope::apply_rope` cos/sin Vecs
+
+**Severity:** Low  
+**Effort:** S  
+**Status:** Open
+
+**Description:**  
+`rope::apply_rope` allocates `Vec<f32>` for cos and sin values on each invocation. During decode, this function is called once per token per layer (30 layers), resulting in 60 small `Vec` allocations per token.
+
+**Impact:**  
+- ~60 allocations/token × ~128 elements × 4 bytes = ~30 KiB/token transient allocation.
+- Minor compared to other optimized paths, but violates zero-allocation decode goal.
+
+**Proposed Fix:**  
+1. Use `apply_rope_cached` exclusively in the decode path (already available via `RopeCache`).
+2. If on-the-fly computation is needed, use a thread-local scratch buffer (same pattern as `QUANT_SCRATCH`).
+
+---
+
 ## Risk Matrix
 
 ```
@@ -811,16 +919,19 @@ C        │       │   G06*   │       │       │
 R  High  │       │ G01 G09  │  G02  │       │
 I        │       │          │  G04  │       │
 T        ├───────┼──────────┼───────┼───────┤
-I  Med   │  G13  │ G03  G12 │       │  G11  │
-C        │  G31  │ G29  G33 │       │       │
-A        ├───────┼──────────┼───────┼───────┤
+I  Med   │  G13  │ G12 G29  │       │  G11  │
+C        │       │ G33 G35  │       │       │
+A        │       │ G36 G37  │       │       │
+         │       │ G38      │       │       │
+         ├───────┼──────────┼───────┼───────┤
 L  Low   │  G19  │ G30  G32 │  G14  │       │
          │  G34  │          │  G16  │       │
+         │  G39  │          │       │       │
          └───────┴──────────┴───────┴───────┘
 ```
 
 * G06 is **Partial** — tiny-model regression tests pass; real-weights `output.contains("Paris")` test now passes; additional diverse-prompt end-to-end tests remain.
-Closed (removed from matrix): G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, G24, G25, G26, G27, G28.
+Closed (removed from matrix): G03, G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, G24, G25, G26, G27, G28, G31.
 ```
 
 ---
@@ -839,7 +950,7 @@ Closed (removed from matrix): G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, 
 1. **G21** ✅ — Weight-scale dequantization fix in `decode_packed_projection` (M, Critical) — **Closed** (`.recip()` removed; `output.contains("Paris")` verified)
 2. **G01** — Exact LLaMA 3 tokenizer from tokenizer.json (M, High)
 3. **G09** — Verify GQA cache layout with golden tests (M, High)
-4. **G03** — Streaming token output (M, Medium)
+4. **G03** ✅ — Streaming token output (M, Medium) — **Closed** (per-token callback + `ControlFlow` early-stop; CLI streaming; actual token count)
 5. **G06** 🔶 — Complete end-to-end golden output tests against real 2B weights (M, Critical)
 
 ### Sprint 3 (Phase 2 Performance) — ✅ CPU Closed; GPU Open
@@ -861,12 +972,17 @@ Closed (removed from matrix): G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, 
 2. **G13** — Dynamic GPU attention sequence length (S, Medium)
 3. **G16** — HTTP server mode (L, Low)
 
-### Sprint 5 (Next Performance — lm_head + Portability)
-1. **G31** — AVX2 lm_head via Backend trait extension (M, Medium) — add `lm_head_matmul_into` to `Backend` so `CpuBackend` can use `dot_f32_f32_avx2`
+### Sprint 5 (Next Performance — Portability + Memory)
+1. **G31** ✅ — AVX2 lm_head via Backend trait extension (M, Medium) — **Closed** (`lm_head_matmul_into` on `Backend` trait; `CpuBackend` uses `dot_f32_f32_fast` + Rayon)
 2. **G33** — f16/bf16 embedding table (M, Medium) — halve lm_head bandwidth (~650 MB f16 vs 1.31 GB f32)
-3. **G32** — Fully fused packed SIMD kernel (M, Low) — inline decode + dot product, eliminate intermediate buffer
-4. **G30** — SSE4.1/NEON fallback (M, Low) — ARM64 + pre-Haswell x86 packed dot products
-5. **G34** — CI regression harness for tokens/sec (S, Low)
+3. **G35** — SSE4.1/NEON SIMD fallbacks (M, Medium) — ARM64 + pre-Haswell x86 for all SIMD kernels
+4. **G36** — Fused packed SIMD kernel (M, Medium) — inline decode + dot product, eliminate intermediate buffer
+5. **G37** — KV cache layout optimization [kv_heads, seq, dim] (M, Medium) — contiguous per-head slices for GQA
+6. **G38** — mmap for safetensors weight loading (M, Medium) — eliminate ~4.3 GB transient heap allocation
+7. **G32** — Fully fused packed SIMD kernel (M, Low) — inline decode + dot product, eliminate intermediate buffer
+8. **G30** — SSE4.1/NEON fallback for packed dot products (M, Low) — ARM64 + pre-Haswell x86
+9. **G39** — Per-token rope cos/sin allocation (S, Low) — thread-local scratch or cached-only path
+10. **G34** — CI regression harness for tokens/sec (S, Low)
 
 ---
 
@@ -882,4 +998,4 @@ A gap is considered **closed** when:
 
 ---
 
-*Last updated: 2025-07 by Ryan Clanton — Phase 2 performance optimizations (commit f8fd086): G23–G28 closed*
+*Last updated: 2025-07 by Ryan Clanton — Phase 3 streaming + zero-copy + SIMD optimizations: G03, G31 closed; G35–G39 opened. Prior: Phase 2 performance optimizations (commit f8fd086): G23–G28 closed.*

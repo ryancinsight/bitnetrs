@@ -337,6 +337,38 @@ pub trait Backend: Send + Sync + 'static {
     fn elementwise_mul(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()>;
 
     // ------------------------------------------------------------------
+    // LM head
+    // ------------------------------------------------------------------
+
+    /// LM head matrix-vector product (unquantised f32 matmul).
+    ///
+    /// ```text
+    /// output[v] = Σ_h  weights[v * hidden_size + h] * hidden[h]
+    /// ```
+    ///
+    /// The default implementation delegates to [`ops::lm_head_matmul_into`].
+    /// Backends with SIMD or GPU compute should override for better throughput.
+    ///
+    /// # Shapes
+    /// - `hidden`:  `[hidden_size]`
+    /// - `weights`: `[vocab_size × hidden_size]` row-major
+    /// - `output`:  `[vocab_size]` — pre-allocated, overwritten
+    ///
+    /// # Errors
+    /// Returns `Err` on shape mismatch or backend dispatch failure.
+    fn lm_head_matmul_into(
+        &self,
+        hidden: &[f32],
+        weights: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        crate::backend::ops::lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Device info
     // ------------------------------------------------------------------
 
@@ -434,6 +466,17 @@ impl Backend for Arc<dyn Backend> {
 
     fn elementwise_mul(&self, a: &[f32], b: &[f32], out: &mut [f32]) -> Result<()> {
         (**self).elementwise_mul(a, b, out)
+    }
+
+    fn lm_head_matmul_into(
+        &self,
+        hidden: &[f32],
+        weights: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        (**self).lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size)
     }
 
     fn device_name(&self) -> &str {

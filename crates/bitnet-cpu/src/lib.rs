@@ -47,6 +47,7 @@ pub mod rope;
 #[allow(unsafe_code)]
 pub mod simd;
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use bitnet_core::backend::Backend;
@@ -143,6 +144,13 @@ impl CpuBackend {
 // Backend impl
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Thread-local scratch buffer for 8-bit activation quantisation.
+    /// Eliminates a `Vec<i8>` heap allocation per GEMV call on the hot path
+    /// (210 calls/token × 2560 bytes = ~540 KB/token saved).
+    static QUANT_SCRATCH: RefCell<Vec<i8>> = RefCell::new(Vec::new());
+}
+
 impl Backend for CpuBackend {
     // ------------------------------------------------------------------
     // Core linear algebra
@@ -217,21 +225,23 @@ impl Backend for CpuBackend {
         out_features: usize,
         in_features: usize,
     ) -> bitnet_core::error::Result<()> {
-        use bitnet_core::quant::absmax::absmax_quantize_row;
-        let (x_q, q_scale) = absmax_quantize_row(input)?;
-        // absmax_quantize_row returns scale = max(|x|) / 127.
-        // ternary_gemv_quantised expects act_scale = max(|x|) for its formula:
-        //   output[i] = (Σ_j W[i,j] * x_q[j]) * weight_scale * act_scale / 127
-        let max_abs = q_scale * 127.0_f32;
-        gemv::ternary_gemv_quantised(
-            weight_packed,
-            weight_scale,
-            &x_q,
-            max_abs,
-            output,
-            out_features,
-            in_features,
-        )
+        use bitnet_core::quant::absmax::absmax_quantize_row_into;
+        QUANT_SCRATCH.with(|buf| {
+            let mut scratch = buf.borrow_mut();
+            scratch.resize(in_features, 0);
+            let q_scale = absmax_quantize_row_into(input, &mut scratch)?;
+            // q_scale = max(|x|) / 127. ternary_gemv_quantised expects max(|x|).
+            let max_abs = q_scale * 127.0_f32;
+            gemv::ternary_gemv_quantised(
+                weight_packed,
+                weight_scale,
+                &scratch,
+                max_abs,
+                output,
+                out_features,
+                in_features,
+            )
+        })
     }
 
     // ------------------------------------------------------------------
@@ -381,6 +391,35 @@ impl Backend for CpuBackend {
         for i in 0..a.len() {
             out[i] = a[i] * b[i];
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // LM head
+    // ------------------------------------------------------------------
+
+    /// LM head matmul with SIMD-accelerated dot products.
+    ///
+    /// Each row dot product dispatches to AVX2+FMA when available,
+    /// with Rayon parallelism across vocabulary rows.
+    fn lm_head_matmul_into(
+        &self,
+        hidden: &[f32],
+        weights: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> bitnet_core::error::Result<()> {
+        use rayon::prelude::*;
+        debug_assert_eq!(hidden.len(), hidden_size);
+        debug_assert_eq!(weights.len(), vocab_size * hidden_size);
+        debug_assert_eq!(output.len(), vocab_size);
+
+        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
+            let row_start = v * hidden_size;
+            let row = &weights[row_start..row_start + hidden_size];
+            *out_elem = simd::dot_f32_f32_fast(row, hidden);
+        });
         Ok(())
     }
 

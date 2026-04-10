@@ -178,11 +178,7 @@ pub fn masked_attention(
                 for t in 0..seq_len {
                     let k_offset = t * kv_stride + kv_h * head_dim;
                     let k_head = &k_cache[k_offset..k_offset + head_dim];
-                    let mut dot = 0.0_f32;
-                    for d in 0..head_dim {
-                        dot += q_head[d] * k_head[d];
-                    }
-                    scores[t] = dot * scale;
+                    scores[t] = super::simd::dot_f32_f32_fast(q_head, k_head) * scale;
                 }
 
                 // Numerically-stable softmax over scores[0..seq_len].
@@ -196,9 +192,7 @@ pub fn masked_attention(
                     let v_offset = t * kv_stride + kv_h * head_dim;
                     let v_head = &v_cache[v_offset..v_offset + head_dim];
                     let attn_weight = scores[t];
-                    for d in 0..head_dim {
-                        out_head[d] += attn_weight * v_head[d];
-                    }
+                    super::simd::axpy_f32_fast(attn_weight, v_head, out_head);
                 }
             });
         });

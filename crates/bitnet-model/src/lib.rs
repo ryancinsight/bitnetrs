@@ -347,6 +347,9 @@ struct ScratchBuffers {
     ffn_out: Vec<f32>,
     final_normed: Vec<f32>,
     logits: Vec<f32>,
+    /// Flat hidden-state buffer for single-token decode path.
+    /// Avoids `Vec<Vec<f32>>` allocation when seq_len == 1.
+    h_single: Vec<f32>,
 }
 
 impl ScratchBuffers {
@@ -371,6 +374,7 @@ impl ScratchBuffers {
             ffn_out: vec![0.0_f32; hidden_size],
             final_normed: vec![0.0_f32; hidden_size],
             logits: vec![0.0_f32; config.vocab_size],
+            h_single: vec![0.0_f32; hidden_size],
         }
     }
 }
@@ -837,6 +841,304 @@ impl BitNetModel {
         // Return logits by cloning from scratch. The scratch buffer is reused
         // on the next call, avoiding repeated allocation of the internal buffer.
         Ok(scratch.logits.clone())
+    }
+
+    /// Forward pass that writes logits directly into the caller's buffer.
+    ///
+    /// Identical to [`forward`] but avoids allocating a new `Vec<f32>` for
+    /// the output logits.  The caller must provide an output buffer of length
+    /// `config.vocab_size`.
+    ///
+    /// # Arguments
+    ///
+    /// - `tokens`:        Input token IDs.
+    /// - `start_pos`:     Absolute sequence position of the first token.
+    /// - `kv_cache`:      Mutable KV cache.
+    /// - `output_logits`: Pre-allocated buffer, length `vocab_size`.  Overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`forward`].
+    pub fn forward_into(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        kv_cache: &mut KVCache,
+        output_logits: &mut [f32],
+    ) -> anyhow::Result<()> {
+        if tokens.is_empty() {
+            return Err(anyhow!("forward_into: tokens must not be empty"));
+        }
+        if output_logits.len() != self.config.vocab_size {
+            return Err(anyhow!(
+                "forward_into: output_logits.len() = {} but vocab_size = {}",
+                output_logits.len(),
+                self.config.vocab_size
+            ));
+        }
+
+        let seq_len = tokens.len();
+        let end_pos = start_pos + seq_len;
+
+        if end_pos > self.config.max_position_embeddings {
+            return Err(anyhow!(
+                "forward_into: sequence position {} exceeds max_position_embeddings {}",
+                end_pos,
+                self.config.max_position_embeddings
+            ));
+        }
+
+        if end_pos > kv_cache.max_seq {
+            return Err(anyhow!(
+                "forward_into: sequence position {} exceeds kv_cache.max_seq {}",
+                end_pos,
+                kv_cache.max_seq
+            ));
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let head_dim = self.config.head_dim();
+        let n_heads = self.config.num_attention_heads;
+        let n_kv_heads = self.config.num_key_value_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let ffn_dim = self.config.intermediate_size;
+        let rope_theta = self.config.rope_theta;
+        let eps = self.config.rms_norm_eps;
+
+        // For decode (seq_len == 1), use the pre-allocated scratch buffer
+        // to avoid Vec<Vec<f32>> allocation. For prefill, use the Vec path.
+        let is_decode = seq_len == 1;
+
+        if is_decode {
+            // ── Decode fast path: single token, zero allocation ──────────
+            let tok_id = tokens[0] as usize;
+            let position = start_pos;
+            let scratch = &mut self.scratch;
+
+            // Copy embedding into scratch.h_single (avoids .to_vec() alloc).
+            let emb_start = tok_id * hidden_size;
+            let emb_end = emb_start + hidden_size;
+            scratch
+                .h_single
+                .copy_from_slice(&self.weights.embed_tokens[emb_start..emb_end]);
+
+            for layer_idx in 0..self.config.num_hidden_layers {
+                let layer = &self.weights.layers[layer_idx];
+                let h = &mut scratch.h_single;
+
+                // Pre-attention RMSNorm
+                self.backend
+                    .rms_norm(h, &layer.attention_norm, eps, &mut scratch.h_norm)
+                    .with_context(|| format!("layer {layer_idx}: attention_norm"))?;
+
+                // Q projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.q_proj.data,
+                        layer.q_proj.scale,
+                        &scratch.h_norm,
+                        &mut scratch.q_buf,
+                        q_dim,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: q_proj"))?;
+
+                // K projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.k_proj.data,
+                        layer.k_proj.scale,
+                        &scratch.h_norm,
+                        &mut scratch.k_buf,
+                        kv_dim,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: k_proj"))?;
+
+                // V projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.v_proj.data,
+                        layer.v_proj.scale,
+                        &scratch.h_norm,
+                        &mut scratch.v_buf,
+                        kv_dim,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: v_proj"))?;
+
+                // RoPE
+                self.backend
+                    .rope_embed(
+                        &mut scratch.q_buf,
+                        &mut scratch.k_buf,
+                        position,
+                        head_dim,
+                        n_heads,
+                        n_kv_heads,
+                        rope_theta,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: rope_embed"))?;
+
+                // Store KV
+                kv_cache
+                    .store_kv(layer_idx, position, &scratch.k_buf, &scratch.v_buf)
+                    .with_context(|| format!("layer {layer_idx}: store_kv"))?;
+
+                // Causal attention
+                let k_cache_slice = {
+                    let len = (position + 1) * kv_cache.kv_stride;
+                    &kv_cache.k[layer_idx][..len]
+                };
+                let v_cache_slice = {
+                    let len = (position + 1) * kv_cache.kv_stride;
+                    &kv_cache.v[layer_idx][..len]
+                };
+
+                self.backend
+                    .masked_attention(
+                        &scratch.q_buf,
+                        k_cache_slice,
+                        v_cache_slice,
+                        &mut scratch.attn_out,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        position,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: masked_attention"))?;
+
+                // Attention sub-layer norm
+                self.backend
+                    .rms_norm(
+                        &scratch.attn_out,
+                        &layer.attn_sub_norm,
+                        eps,
+                        &mut scratch.attn_normed,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: attn_sub_norm"))?;
+
+                // Output projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.o_proj.data,
+                        layer.o_proj.scale,
+                        &scratch.attn_normed,
+                        &mut scratch.o_out,
+                        hidden_size,
+                        q_dim,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: o_proj"))?;
+
+                // Residual (attention)
+                let h = &mut scratch.h_single;
+                for i in 0..hidden_size {
+                    h[i] += scratch.o_out[i];
+                }
+
+                // Pre-FFN RMSNorm
+                self.backend
+                    .rms_norm(h, &layer.ffn_norm, eps, &mut scratch.ffn_h_norm)
+                    .with_context(|| format!("layer {layer_idx}: ffn_norm"))?;
+
+                // Gate projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.gate_proj.data,
+                        layer.gate_proj.scale,
+                        &scratch.ffn_h_norm,
+                        &mut scratch.gate,
+                        ffn_dim,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: gate_proj"))?;
+
+                // Up projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.up_proj.data,
+                        layer.up_proj.scale,
+                        &scratch.ffn_h_norm,
+                        &mut scratch.up,
+                        ffn_dim,
+                        hidden_size,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: up_proj"))?;
+
+                // Squared ReLU
+                self.backend
+                    .squared_relu(&mut scratch.gate)
+                    .with_context(|| format!("layer {layer_idx}: squared_relu"))?;
+
+                // Gate ⊙ up
+                self.backend
+                    .elementwise_mul(&scratch.gate, &scratch.up, &mut scratch.inner)
+                    .with_context(|| format!("layer {layer_idx}: gate * up"))?;
+
+                // FFN sub-layer norm
+                self.backend
+                    .rms_norm(
+                        &scratch.inner,
+                        &layer.ffn_sub_norm,
+                        eps,
+                        &mut scratch.inner_normed,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: ffn_sub_norm"))?;
+
+                // Down projection
+                self.backend
+                    .ternary_gemv_with_activation_quant(
+                        &layer.down_proj.data,
+                        layer.down_proj.scale,
+                        &scratch.inner_normed,
+                        &mut scratch.ffn_out,
+                        hidden_size,
+                        ffn_dim,
+                    )
+                    .with_context(|| format!("layer {layer_idx}: down_proj"))?;
+
+                // Residual (FFN)
+                let h = &mut scratch.h_single;
+                for i in 0..hidden_size {
+                    h[i] += scratch.ffn_out[i];
+                }
+
+                trace!(layer = layer_idx, pos = position, "Decode layer processed");
+            }
+
+            // Advance KV cache
+            kv_cache.advance();
+
+            // Final norm + LM head → write directly into output_logits
+            self.backend
+                .rms_norm(
+                    &scratch.h_single,
+                    &self.weights.final_norm,
+                    eps,
+                    &mut scratch.final_normed,
+                )
+                .context("final_norm")?;
+
+            lm_head_matmul_into(
+                &scratch.final_normed,
+                &self.weights.lm_head,
+                output_logits,
+                self.config.vocab_size,
+                hidden_size,
+            );
+
+            debug!(
+                vocab_size = output_logits.len(),
+                "Forward (decode) complete"
+            );
+            Ok(())
+        } else {
+            // ── Prefill path: delegate to existing forward, copy result ──
+            let logits = self.forward(tokens, start_pos, kv_cache)?;
+            output_logits.copy_from_slice(&logits);
+            Ok(())
+        }
     }
 
     // ------------------------------------------------------------------

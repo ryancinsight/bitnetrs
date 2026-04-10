@@ -597,6 +597,165 @@ fn dot_f32_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// axpy: out[i] += alpha * x[i]
+// ---------------------------------------------------------------------------
+
+/// Fused multiply-add: `out[i] += alpha * x[i]` for all i.
+///
+/// Used in attention value accumulation: `out_head += attn_weight * v_head`.
+/// AVX2+FMA path processes 8 floats per cycle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn axpy_f32_avx2(alpha: f32, x: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(x.len(), out.len());
+
+    let len = x.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+    let valpha = _mm256_set1_ps(alpha);
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let vx = _mm256_loadu_ps(x.as_ptr().add(base));
+        let vo = _mm256_loadu_ps(out.as_ptr().add(base));
+        let result = _mm256_fmadd_ps(valpha, vx, vo);
+        _mm256_storeu_ps(out.as_mut_ptr().add(base), result);
+    }
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            out[base + i] += alpha * x[base + i];
+        }
+    }
+}
+
+/// axpy with automatic SIMD dispatch.
+///
+/// Computes `out[i] += alpha * x[i]` for all i.
+#[inline]
+pub fn axpy_f32_fast(alpha: f32, x: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() {
+            // Safety: AVX2+FMA availability confirmed above.
+            unsafe { axpy_f32_avx2(alpha, x, out) };
+            return;
+        }
+    }
+    axpy_f32_scalar(alpha, x, out);
+}
+
+/// Scalar axpy fallback.
+#[inline]
+fn axpy_f32_scalar(alpha: f32, x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(x.len(), out.len());
+    for i in 0..x.len() {
+        out[i] += alpha * x[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sum_squares: Σ x[i]²
+// ---------------------------------------------------------------------------
+
+/// SIMD-accelerated sum of squares: Σ x[i]².
+///
+/// Used in RMSNorm. AVX2+FMA path processes 8 floats per cycle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sum_squares_f32_avx2(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = x.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let vx = _mm256_loadu_ps(x.as_ptr().add(base));
+        acc = _mm256_fmadd_ps(vx, vx, acc);
+    }
+
+    let mut result = hsum_f32_avx2(acc);
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            result += x[base + i] * x[base + i];
+        }
+    }
+
+    result
+}
+
+/// Sum of squares with automatic SIMD dispatch.
+#[inline]
+pub fn sum_squares_f32_fast(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() {
+            return unsafe { sum_squares_f32_avx2(x) };
+        }
+    }
+    x.iter().map(|&v| v * v).sum()
+}
+
+// ---------------------------------------------------------------------------
+// mul_scale: out[i] = x[i] * scale * w[i]
+// ---------------------------------------------------------------------------
+
+/// SIMD-accelerated elementwise multiply-scale: `out[i] = x[i] * scale * w[i]`.
+///
+/// Used in RMSNorm output pass: `out[i] = input[i] * inv_rms * weight[i]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn mul_scale_f32_avx2(x: &[f32], scale: f32, w: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(x.len(), w.len());
+    debug_assert_eq!(x.len(), out.len());
+
+    let len = x.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+    let vscale = _mm256_set1_ps(scale);
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let vx = _mm256_loadu_ps(x.as_ptr().add(base));
+        let vw = _mm256_loadu_ps(w.as_ptr().add(base));
+        let scaled = _mm256_mul_ps(vx, vscale);
+        let result = _mm256_mul_ps(scaled, vw);
+        _mm256_storeu_ps(out.as_mut_ptr().add(base), result);
+    }
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            out[base + i] = x[base + i] * scale * w[base + i];
+        }
+    }
+}
+
+/// Elementwise multiply-scale with automatic SIMD dispatch.
+#[inline]
+pub fn mul_scale_f32_fast(x: &[f32], scale: f32, w: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { mul_scale_f32_avx2(x, scale, w, out) };
+            return;
+        }
+    }
+    for i in 0..x.len() {
+        out[i] = x[i] * scale * w[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

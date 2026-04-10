@@ -444,6 +444,18 @@ impl Backend for NpuBackend {
         self.inner.elementwise_mul(a, b, out)
     }
 
+    fn lm_head_matmul_into(
+        &self,
+        hidden: &[f32],
+        weights: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        self.inner
+            .lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size)
+    }
+
     // ------------------------------------------------------------------
     // Device info
     // ------------------------------------------------------------------

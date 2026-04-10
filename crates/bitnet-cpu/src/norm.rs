@@ -126,16 +126,14 @@ pub fn rms_norm_unchecked(input: &[f32], weight: &[f32], eps: f32, output: &mut 
     let d = input.len() as f32;
 
     // Σ x_i²
-    let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
+    let sum_sq: f32 = super::simd::sum_squares_f32_fast(input);
 
     // rms = sqrt( mean(x²) + ε )
     let rms = (sum_sq / d + eps).sqrt();
     let inv_rms = rms.recip(); // 1 / rms
 
     // out[i] = x[i] * (1/rms) * γ[i]
-    for i in 0..input.len() {
-        output[i] = input[i] * inv_rms * weight[i];
-    }
+    super::simd::mul_scale_f32_fast(input, inv_rms, weight, output);
 }
 
 /// Apply RMSNorm *in-place*, updating `buf` using `weight` as the scale.
@@ -163,7 +161,7 @@ pub fn rms_norm_inplace(buf: &mut [f32], weight: &[f32], eps: f32) -> Result<()>
     }
 
     let d = buf.len() as f32;
-    let sum_sq: f32 = buf.iter().map(|&x| x * x).sum();
+    let sum_sq: f32 = super::simd::sum_squares_f32_fast(buf);
     let inv_rms = (sum_sq / d + eps).sqrt().recip();
 
     for i in 0..buf.len() {

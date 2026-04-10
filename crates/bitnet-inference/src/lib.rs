@@ -500,6 +500,8 @@ pub struct InferenceEngine {
     kv_cache: KVCache,
     /// Pre-allocated scratch buffers for token sampling.
     sampling_buffers: SamplingBuffers,
+    /// Pre-allocated logits buffer for zero-copy forward pass.
+    logits_buf: Vec<f32>,
 }
 
 impl std::fmt::Debug for InferenceEngine {
@@ -592,6 +594,7 @@ impl InferenceEngine {
         )?;
 
         let sampling_buffers = SamplingBuffers::new(config.vocab_size);
+        let logits_buf = vec![0.0_f32; config.vocab_size];
 
         info!(backend = %model.backend_name(), "InferenceEngine ready");
 
@@ -600,6 +603,7 @@ impl InferenceEngine {
             tokenizer,
             kv_cache,
             sampling_buffers,
+            logits_buf,
         })
     }
 
@@ -634,35 +638,100 @@ impl InferenceEngine {
         tokens: Vec<u32>,
         sampling: &SamplingConfig,
     ) -> anyhow::Result<String> {
+        // Delegate to streaming version with a no-op callback.
+        let (text, _n_tokens) =
+            self.generate_from_tokens_streaming(tokens, sampling, &mut |_| {
+                std::ops::ControlFlow::Continue(())
+            })?;
+        Ok(text)
+    }
+
+    /// Generate text with per-token streaming output.
+    ///
+    /// Each generated token is decoded and passed to `on_token`. The callback
+    /// receives the decoded text fragment and returns `ControlFlow::Continue(())`
+    /// to keep generating or `ControlFlow::Break(())` to stop early.
+    ///
+    /// Returns the complete generated text and the number of generated tokens.
+    ///
+    /// # Arguments
+    ///
+    /// - `prompt`:   Raw text prompt (not chat-formatted).
+    /// - `sampling`: Sampling hyperparameters.
+    /// - `on_token`: Callback invoked for each generated token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding, model forward, or decoding fails.
+    #[instrument(level = "info", skip(self, prompt, sampling, on_token), fields(prompt_len = prompt.len()))]
+    pub fn generate_streaming(
+        &mut self,
+        prompt: &str,
+        sampling: &SamplingConfig,
+        mut on_token: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<(String, usize)> {
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
+            .context("Failed to encode raw prompt with BOS")?;
+        self.generate_from_tokens_streaming(tokens, sampling, &mut on_token)
+    }
+
+    /// Generate chat response with per-token streaming output.
+    ///
+    /// Returns the complete response text and the number of generated tokens.
+    #[instrument(
+        level = "info",
+        skip(self, messages, sampling, on_token),
+        fields(n_messages = messages.len())
+    )]
+    pub fn generate_chat_streaming(
+        &mut self,
+        messages: &[ChatMessage],
+        sampling: &SamplingConfig,
+        mut on_token: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<(String, usize)> {
+        let tokens = self
+            .tokenizer
+            .encode_chat(messages)
+            .context("Failed to encode chat template")?;
+        self.generate_from_tokens_streaming(tokens, sampling, &mut on_token)
+    }
+
+    fn generate_from_tokens_streaming(
+        &mut self,
+        tokens: Vec<u32>,
+        sampling: &SamplingConfig,
+        on_token: &mut dyn FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<(String, usize)> {
         sampling.validate().context("Invalid sampling config")?;
 
         if tokens.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), 0));
         }
 
         // Reset KV cache for a clean generation.
         self.kv_cache.clear();
 
-        // Prefill: process all prompt tokens.
-        let mut logits = self
-            .model
-            .forward(&tokens, 0, &mut self.kv_cache)
+        // Prefill: process all prompt tokens using forward_into (zero-copy).
+        self.model
+            .forward_into(&tokens, 0, &mut self.kv_cache, &mut self.logits_buf)
             .context("Prefill forward pass failed")?;
 
         debug!(prefill_tokens = tokens.len(), "Prefill complete");
 
-        // Maintain a single growing token buffer instead of rebuilding every step.
-        let prompt_len = tokens.len();
-        let mut all_tokens = tokens; // take ownership, avoid clone
+        let mut all_tokens = tokens;
         all_tokens.reserve(sampling.max_new_tokens);
 
-        let eos_eot = self.tokenizer.eos_token_id(); // 128009 <|eot_id|>
-        let eos_eot_text = 128_001_u32; // <|end_of_text|>
+        let eos_eot = self.tokenizer.eos_token_id();
+        let eos_eot_text = 128_001_u32;
+
+        let mut n_generated = 0usize;
+        let mut output_text = String::new();
 
         for step in 0..sampling.max_new_tokens {
-            // Sample next token from the accumulated context.
             let next_token = sample_next_token(
-                &mut logits,
+                &mut self.logits_buf,
                 sampling,
                 &all_tokens,
                 &mut self.sampling_buffers,
@@ -678,25 +747,34 @@ impl InferenceEngine {
             }
 
             all_tokens.push(next_token);
+            n_generated += 1;
+
+            // Decode the single token to text and stream it.
+            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            output_text.push_str(&token_text);
+
+            // Invoke the callback with the decoded fragment.
+            if let std::ops::ControlFlow::Break(()) = on_token(&token_text) {
+                debug!(step, "Streaming stopped by callback");
+                break;
+            }
+
             debug!(step, token = next_token, "Generated token");
 
-            // Decode step: forward pass for the single new token.
+            // Decode step: forward pass for the single new token (zero-copy).
             let cur_pos = self.kv_cache.filled_positions;
-            logits = self
-                .model
-                .forward(&[next_token], cur_pos, &mut self.kv_cache)
+            self.model
+                .forward_into(
+                    &[next_token],
+                    cur_pos,
+                    &mut self.kv_cache,
+                    &mut self.logits_buf,
+                )
                 .with_context(|| format!("Decode forward pass failed at step {step}"))?;
         }
 
-        debug!(
-            n_generated = all_tokens.len() - prompt_len,
-            "Generation complete"
-        );
-
-        // Decode only the generated tokens (after the prompt) to text.
-        self.tokenizer
-            .decode(&all_tokens[prompt_len..])
-            .context("Failed to decode generated tokens")
+        debug!(n_generated, "Streaming generation complete");
+        Ok((output_text, n_generated))
     }
 
     /// Generate a response for a chat conversation.
@@ -873,6 +951,35 @@ impl ChatPipeline {
         self.history.push(ChatMessage::assistant(&response));
 
         Ok(response)
+    }
+
+    /// Send a user message and receive a streaming assistant response.
+    ///
+    /// Each generated token is decoded and passed to `on_token`. Returns
+    /// the complete response and the token count.
+    pub fn chat_streaming(
+        &mut self,
+        user_message: &str,
+        sampling: &SamplingConfig,
+        on_token: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) -> anyhow::Result<(String, usize)> {
+        let mut messages: Vec<ChatMessage> = Vec::new();
+
+        if !self.system_prompt.is_empty() {
+            messages.push(ChatMessage::system(&self.system_prompt));
+        }
+
+        messages.extend_from_slice(&self.history);
+        messages.push(ChatMessage::user(user_message));
+
+        let (response, n_tokens) = self
+            .engine
+            .generate_chat_streaming(&messages, sampling, on_token)?;
+
+        self.history.push(ChatMessage::user(user_message));
+        self.history.push(ChatMessage::assistant(&response));
+
+        Ok((response, n_tokens))
     }
 
     /// Reset the conversation history (keeps the system prompt).

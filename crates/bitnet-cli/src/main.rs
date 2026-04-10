@@ -549,15 +549,22 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
     io::stdout().flush().ok();
 
     let start = std::time::Instant::now();
-    let continuation = engine
-        .generate(&args.prompt, &sampling)
+    let (_continuation, n_tokens) = engine
+        .generate_streaming(&args.prompt, &sampling, |token_text| {
+            print!("{token_text}");
+            io::stdout().flush().ok();
+            std::ops::ControlFlow::Continue(())
+        })
         .context("Generation failed")?;
     let elapsed = start.elapsed();
 
-    println!("{continuation}");
+    println!(); // newline after streaming output
 
-    let n_tokens = continuation.split_whitespace().count();
-    let tokens_per_sec = n_tokens as f64 / elapsed.as_secs_f64();
+    let tokens_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        n_tokens as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
     eprintln!("\n[{n_tokens} tokens in {elapsed:.1?} → {tokens_per_sec:.1} tok/s]");
 
     Ok(())
@@ -670,15 +677,24 @@ fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         }
 
         let start = std::time::Instant::now();
-        match pipeline.chat(input, &sampling) {
-            Ok(response) => {
-                println!("{response}");
+        match pipeline.chat_streaming(input, &sampling, |token_text| {
+            print!("{token_text}");
+            io::stdout().flush().ok();
+            std::ops::ControlFlow::Continue(())
+        }) {
+            Ok((_response, n_tokens)) => {
+                println!(); // newline after streaming output
                 let elapsed = start.elapsed();
-                let n_words = response.split_whitespace().count();
+                let tokens_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                    n_tokens as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
                 debug!(
                     turn,
-                    response_words = n_words,
+                    n_tokens,
                     elapsed_ms = elapsed.as_millis(),
+                    tokens_per_sec = format!("{tokens_per_sec:.1}"),
                     "Chat turn complete"
                 );
                 turn += 1;
