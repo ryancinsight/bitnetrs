@@ -34,12 +34,12 @@
 //!
 //! ## KV Cache Layout
 //!
-//! Both `k_cache` and `v_cache` are flat row-major `f32` slices of shape
-//! `[(cur_pos+1) × n_kv_heads × head_dim]`:
+//! Both `k_cache` and `v_cache` are flat head-major `f32` slices of shape
+//! `[n_kv_heads × (cur_pos+1) × head_dim]`:
 //!
 //! ```text
-//! cache[t, kv_h, d] = cache[ t * n_kv_heads * head_dim
-//!                           + kv_h * head_dim
+//! cache[kv_h, t, d] = cache[ kv_h * ((cur_pos + 1) * head_dim)
+//!                           + t * head_dim
 //!                           + d ]
 //! ```
 //!
@@ -52,8 +52,8 @@
 //! # Invariants
 //!
 //! - `q.len() == n_heads * head_dim`
-//! - `k_cache.len() >= (cur_pos + 1) * n_kv_heads * head_dim`
-//! - `v_cache.len() >= (cur_pos + 1) * n_kv_heads * head_dim`
+//! - `k_cache.len() >= n_kv_heads * (cur_pos + 1) * head_dim`
+//! - `v_cache.len() >= n_kv_heads * (cur_pos + 1) * head_dim`
 //! - `output.len() == n_heads * head_dim`
 //! - `n_heads % n_kv_heads == 0`
 //! - `head_dim > 0`
@@ -81,8 +81,8 @@ thread_local! {
 /// # Arguments
 ///
 /// - `q`:        Query tensor, shape `[n_heads × head_dim]`.
-/// - `k_cache`:  Key cache, shape `[(cur_pos+1) × n_kv_heads × head_dim]`.
-/// - `v_cache`:  Value cache, shape `[(cur_pos+1) × n_kv_heads × head_dim]`.
+/// - `k_cache`:  Key cache, shape `[n_kv_heads × (cur_pos+1) × head_dim]`.
+/// - `v_cache`:  Value cache, shape `[n_kv_heads × (cur_pos+1) × head_dim]`.
 /// - `output`:   Pre-allocated output, shape `[n_heads × head_dim]`.
 /// - `n_heads`:  Number of query heads `H`.
 /// - `n_kv_heads`: Number of key/value heads `H_kv` (must divide `H`).
@@ -125,8 +125,8 @@ pub fn masked_attention(
     }
 
     let seq_len = cur_pos + 1; // number of positions in cache
-    let kv_stride = n_kv_heads * head_dim; // bytes per time-step in cache
-    let required_cache = seq_len * kv_stride;
+    let head_stride = seq_len * head_dim; // elements per KV head in cache
+    let required_cache = n_kv_heads * head_stride;
 
     let q_expected = n_heads * head_dim;
     if q.len() != q_expected {
@@ -174,9 +174,10 @@ pub fn masked_attention(
                 scores.clear();
                 scores.resize(seq_len, 0.0_f32);
 
-                // Compute attention scores: score[t] = dot(q_head, k_cache[t, kv_h]) * scale
+                // Compute attention scores: score[t] = dot(q_head, k_cache[kv_h, t]) * scale
+                let k_head_base = kv_h * head_stride;
                 for t in 0..seq_len {
-                    let k_offset = t * kv_stride + kv_h * head_dim;
+                    let k_offset = k_head_base + t * head_dim;
                     let k_head = &k_cache[k_offset..k_offset + head_dim];
                     scores[t] = super::simd::dot_f32_f32_fast(q_head, k_head) * scale;
                 }
@@ -184,12 +185,13 @@ pub fn masked_attention(
                 // Numerically-stable softmax over scores[0..seq_len].
                 softmax_f32(&mut scores[..seq_len]);
 
-                // Compute attended output: out_head = Σ_t attn[t] * v_cache[t, kv_h]
+                // Compute attended output: out_head = Σ_t attn[t] * v_cache[kv_h, t]
                 for d in 0..head_dim {
                     out_head[d] = 0.0;
                 }
+                let v_head_base = kv_h * head_stride;
                 for t in 0..seq_len {
-                    let v_offset = t * kv_stride + kv_h * head_dim;
+                    let v_offset = v_head_base + t * head_dim;
                     let v_head = &v_cache[v_offset..v_offset + head_dim];
                     let attn_weight = scores[t];
                     super::simd::axpy_f32_fast(attn_weight, v_head, out_head);
@@ -214,7 +216,7 @@ mod tests {
         vec![val; seq_len * n_kv_heads * head_dim]
     }
 
-    /// Build a KV cache where cache[t, kv_h, d] = t as f32 * scale (unique per position).
+    /// Build a KV cache where cache[kv_h, t, d] = t as f32 * scale (unique per position).
     fn make_positional_cache(
         seq_len: usize,
         n_kv_heads: usize,
@@ -222,10 +224,10 @@ mod tests {
         scale: f32,
     ) -> Vec<f32> {
         let mut cache = vec![0.0_f32; seq_len * n_kv_heads * head_dim];
-        for t in 0..seq_len {
-            for kv_h in 0..n_kv_heads {
+        for kv_h in 0..n_kv_heads {
+            for t in 0..seq_len {
                 for d in 0..head_dim {
-                    let idx = t * n_kv_heads * head_dim + kv_h * head_dim + d;
+                    let idx = kv_h * seq_len * head_dim + t * head_dim + d;
                     cache[idx] = t as f32 * scale;
                 }
             }
@@ -277,10 +279,11 @@ mod tests {
             k_cache[i] = (i + 1) as f32;
         }
         let mut v_cache = vec![0.0_f32; seq_len * 1 * head_dim];
-        // V[t, 0, 0] = (t+1) as f32, V[t, 0, 1] = 0
+        // V[0, t, 0] = (t+1) as f32, V[0, t, 1] = 0
         for t in 0..seq_len {
-            v_cache[t * head_dim] = (t + 1) as f32; // [1, 2, 3]
-            v_cache[t * head_dim + 1] = 0.0;
+            let base = t * head_dim;
+            v_cache[base] = (t + 1) as f32; // [1, 2, 3]
+            v_cache[base + 1] = 0.0;
         }
 
         let mut output = vec![0.0_f32; head_dim];
@@ -312,11 +315,11 @@ mod tests {
 
         let q = vec![1000.0_f32, 0.0];
         let mut k_cache = vec![0.0_f32; seq_len * head_dim]; // n_kv_heads=1
-                                                             // K[0] = [0, 0], K[1] = [0, 0], K[2] = [1, 0]
+                                                             // K[0, 0] = [0, 0], K[0, 1] = [0, 0], K[0, 2] = [1, 0]
         k_cache[2 * head_dim] = 1.0;
 
         let mut v_cache = vec![0.0_f32; seq_len * head_dim];
-        // V[0] = [1, 0], V[1] = [2, 0], V[2] = [99, 0]
+        // V[0, 0] = [1, 0], V[0, 1] = [2, 0], V[0, 2] = [99, 0]
         v_cache[0 * head_dim] = 1.0;
         v_cache[1 * head_dim] = 2.0;
         v_cache[2 * head_dim] = 99.0;
@@ -348,13 +351,13 @@ mod tests {
         let q = vec![0.0_f32; n_heads * head_dim]; // uniform attention
         let k_cache = vec![0.0_f32; seq_len * n_kv_heads * head_dim]; // all zeros → uniform
 
-        // V cache: [pos=0, kv_h=0] = [1, 0], [pos=0, kv_h=1] = [0, 1]
+        // V cache: [kv_h=0, pos=0] = [1, 0], [kv_h=1, pos=0] = [0, 1]
         let mut v_cache = vec![0.0_f32; seq_len * n_kv_heads * head_dim];
-        // layout: [kv_h=0, d=0], [kv_h=0, d=1], [kv_h=1, d=0], [kv_h=1, d=1]
-        v_cache[0] = 1.0; // kv_h=0, d=0
-        v_cache[1] = 0.0; // kv_h=0, d=1
-        v_cache[2] = 0.0; // kv_h=1, d=0
-        v_cache[3] = 1.0; // kv_h=1, d=1
+        // layout: [kv_h=0, pos=0, d=0..1], [kv_h=1, pos=0, d=0..1]
+        v_cache[0] = 1.0; // kv_h=0, pos=0, d=0
+        v_cache[1] = 0.0; // kv_h=0, pos=0, d=1
+        v_cache[2] = 0.0; // kv_h=1, pos=0, d=0
+        v_cache[3] = 1.0; // kv_h=1, pos=0, d=1
 
         let mut output = vec![0.0_f32; n_heads * head_dim];
         masked_attention(
@@ -434,8 +437,9 @@ mod tests {
 
         for t in 0..seq_len {
             for d in 0..head_dim {
-                k_cache[t * head_dim + d] = (t as f32 * 0.1 + d as f32 * 0.2) - 0.5;
-                v_cache[t * head_dim + d] = (t + 1) as f32 * (d + 1) as f32 * 0.1;
+                let idx = t * head_dim + d;
+                k_cache[idx] = (t as f32 * 0.1 + d as f32 * 0.2) - 0.5;
+                v_cache[idx] = (t + 1) as f32 * (d + 1) as f32 * 0.1;
             }
         }
 

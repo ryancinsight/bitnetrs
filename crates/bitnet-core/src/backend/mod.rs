@@ -271,16 +271,25 @@ pub trait Backend: Send + Sync + 'static {
     /// ```text
     /// For query head h (0 ≤ h < n_heads):
     ///   kv_head = h / heads_per_group          (integer division)
-    ///   scores[t] = dot(q[h], k_cache[t, kv_head]) / sqrt(head_dim)
+    ///   scores[t] = dot(q[h], k_cache[kv_head, t]) / sqrt(head_dim)
     ///               for t in 0..=cur_pos
-    ///   attn[h]   = softmax(scores) · v_cache[:, kv_head]
+    ///   attn[h]   = softmax(scores) · v_cache[kv_head, :]
     /// output = concat(attn[0], ..., attn[n_heads-1])
+    /// ```
+    ///
+    /// The KV cache is stored in head-major order to improve temporal locality
+    /// during autoregressive decode:
+    ///
+    /// ```text
+    /// cache[kv_h, t, d] = cache[
+    ///     kv_h * ((cur_pos + 1) * head_dim) + t * head_dim + d
+    /// ]
     /// ```
     ///
     /// # Shapes
     /// - `q`:       `[n_heads × head_dim]`
-    /// - `k_cache`: `[(cur_pos+1) × n_kv_heads × head_dim]` row-major
-    /// - `v_cache`: `[(cur_pos+1) × n_kv_heads × head_dim]` row-major
+    /// - `k_cache`: `[n_kv_heads × (cur_pos+1) × head_dim]` head-major
+    /// - `v_cache`: `[n_kv_heads × (cur_pos+1) × head_dim]` head-major
     /// - `output`:  `[n_heads × head_dim]` — pre-allocated, overwritten.
     ///
     /// # Errors

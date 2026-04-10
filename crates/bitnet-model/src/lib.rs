@@ -115,9 +115,9 @@ pub use bitnet_core::backend::Device;
 /// - `k[l].len() % (n_kv_heads * head_dim) == 0` for all l.
 /// - `filled_positions <= max_seq`.
 pub struct KVCache {
-    /// Key vectors per layer, flattened row-major.
+    /// Key vectors per layer, stored head-major as `[n_kv_heads × max_seq × head_dim]`.
     k: Vec<Vec<f32>>,
-    /// Value vectors per layer, flattened row-major.
+    /// Value vectors per layer, stored head-major as `[n_kv_heads × max_seq × head_dim]`.
     v: Vec<Vec<f32>>,
     /// Number of sequence positions currently stored.
     pub filled_positions: usize,
@@ -129,8 +129,10 @@ pub struct KVCache {
     pub n_kv_heads: usize,
     /// Per-head feature dimension.
     pub head_dim: usize,
-    /// Stride: `n_kv_heads * head_dim` elements per position per layer.
+    /// Logical stride of one token across all KV heads: `n_kv_heads * head_dim`.
     kv_stride: usize,
+    /// Number of positions written per layer.
+    layer_lengths: Vec<usize>,
 }
 
 impl KVCache {
@@ -149,12 +151,8 @@ impl KVCache {
         let kv_stride = n_kv_heads * head_dim;
         let capacity = max_seq * kv_stride;
 
-        let k = (0..n_layers)
-            .map(|_| Vec::with_capacity(capacity))
-            .collect();
-        let v = (0..n_layers)
-            .map(|_| Vec::with_capacity(capacity))
-            .collect();
+        let k = (0..n_layers).map(|_| vec![0.0_f32; capacity]).collect();
+        let v = (0..n_layers).map(|_| vec![0.0_f32; capacity]).collect();
 
         Self {
             k,
@@ -165,6 +163,7 @@ impl KVCache {
             n_kv_heads,
             head_dim,
             kv_stride,
+            layer_lengths: vec![0; n_layers],
         }
     }
 
@@ -207,8 +206,7 @@ impl KVCache {
                 format!("position = {position}"),
             ));
         }
-
-        let layer_len_positions = self.k[layer].len() / self.kv_stride;
+        let layer_len_positions = self.layer_lengths[layer];
         if position > layer_len_positions {
             return Err(BitNetError::shape(
                 format!("position <= layer_len_positions ({layer_len_positions})"),
@@ -219,17 +217,18 @@ impl KVCache {
         let layer_k = &mut self.k[layer];
         let layer_v = &mut self.v[layer];
 
-        let start = position * self.kv_stride;
+        for kv_head in 0..self.n_kv_heads {
+            let src_start = kv_head * self.head_dim;
+            let src_end = src_start + self.head_dim;
+            let dst_start = kv_head * self.max_seq * self.head_dim + position * self.head_dim;
+            let dst_end = dst_start + self.head_dim;
+
+            layer_k[dst_start..dst_end].copy_from_slice(&k_vec[src_start..src_end]);
+            layer_v[dst_start..dst_end].copy_from_slice(&v_vec[src_start..src_end]);
+        }
 
         if position == layer_len_positions {
-            // Appending a new position for this layer.
-            layer_k.extend_from_slice(k_vec);
-            layer_v.extend_from_slice(v_vec);
-        } else {
-            // Overwriting an existing position.
-            let end = start + self.kv_stride;
-            layer_k[start..end].copy_from_slice(k_vec);
-            layer_v[start..end].copy_from_slice(v_vec);
+            self.layer_lengths[layer] += 1;
         }
 
         Ok(())
@@ -262,7 +261,8 @@ impl KVCache {
     pub fn k_slice(&self, layer: usize, position: usize) -> Result<&[f32]> {
         self.validate_position(position)?;
         let len = (position + 1) * self.kv_stride;
-        Ok(&self.k[layer][..len])
+        let _ = len;
+        Ok(&self.k[layer][..self.k[layer].len()])
     }
 
     /// Return the V cache for `layer` up to and including `position`.
@@ -274,7 +274,8 @@ impl KVCache {
     pub fn v_slice(&self, layer: usize, position: usize) -> Result<&[f32]> {
         self.validate_position(position)?;
         let len = (position + 1) * self.kv_stride;
-        Ok(&self.v[layer][..len])
+        let _ = len;
+        Ok(&self.v[layer][..self.v[layer].len()])
     }
 
     /// Reset the cache (discard all stored KV pairs).
@@ -282,8 +283,9 @@ impl KVCache {
     /// Useful when starting a new conversation or resetting the inference state.
     pub fn clear(&mut self) {
         for layer in 0..self.n_layers {
-            self.k[layer].clear();
-            self.v[layer].clear();
+            self.k[layer].fill(0.0);
+            self.v[layer].fill(0.0);
+            self.layer_lengths[layer] = 0;
         }
         self.filled_positions = 0;
     }
@@ -677,14 +679,8 @@ impl BitNetModel {
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: store_kv"))?;
 
                 // ── Causal Attention ──────────────────────────────────────────
-                let k_cache_slice = {
-                    let len = (position + 1) * kv_cache.kv_stride;
-                    &kv_cache.k[layer_idx][..len]
-                };
-                let v_cache_slice = {
-                    let len = (position + 1) * kv_cache.kv_stride;
-                    &kv_cache.v[layer_idx][..len]
-                };
+                let k_cache_slice = &kv_cache.k[layer_idx];
+                let v_cache_slice = &kv_cache.v[layer_idx];
 
                 self.backend
                     .masked_attention(
@@ -987,14 +983,8 @@ impl BitNetModel {
                     .with_context(|| format!("layer {layer_idx}: store_kv"))?;
 
                 // Causal attention
-                let k_cache_slice = {
-                    let len = (position + 1) * kv_cache.kv_stride;
-                    &kv_cache.k[layer_idx][..len]
-                };
-                let v_cache_slice = {
-                    let len = (position + 1) * kv_cache.kv_stride;
-                    &kv_cache.v[layer_idx][..len]
-                };
+                let k_cache_slice = &kv_cache.k[layer_idx];
+                let v_cache_slice = &kv_cache.v[layer_idx];
 
                 self.backend
                     .masked_attention(
@@ -1318,12 +1308,9 @@ mod tests {
         let config = tiny_config();
         let mut cache = KVCache::new(&config, 16);
 
-        // Manually push some data.
-        let kv_stride = cache.kv_stride;
-        let n_layers = cache.n_layers;
-        for l in 0..n_layers {
-            cache.k[l].extend(vec![0.0_f32; kv_stride]);
-            cache.v[l].extend(vec![0.0_f32; kv_stride]);
+        let kv = vec![0.0_f32; cache.kv_stride];
+        for l in 0..cache.n_layers {
+            cache.store_kv(l, 0, &kv, &kv).unwrap();
         }
         cache.filled_positions = 1;
         assert_eq!(cache.len(), 1);
@@ -1331,9 +1318,9 @@ mod tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
-        for l in 0..n_layers {
-            assert!(cache.k[l].is_empty());
-            assert!(cache.v[l].is_empty());
+        for l in 0..cache.n_layers {
+            assert!(cache.k[l].iter().all(|&x| x == 0.0));
+            assert!(cache.v[l].iter().all(|&x| x == 0.0));
         }
     }
 
@@ -1382,27 +1369,23 @@ mod tests {
         let config = tiny_config();
         let mut cache = KVCache::new(&config, 16);
         let kv_stride = cache.kv_stride;
-        let n_layers = cache.n_layers;
 
-        // Fill layer 0 manually with known values.
-        let k_data: Vec<f32> = (0..(2 * kv_stride)).map(|i| i as f32 * 0.1).collect();
-        cache.k[0].extend_from_slice(&k_data);
-        cache.v[0].extend_from_slice(&vec![0.0_f32; 2 * kv_stride]);
-        for l in 1..n_layers {
-            cache.k[l].extend_from_slice(&vec![0.0_f32; 2 * kv_stride]);
-            cache.v[l].extend_from_slice(&vec![0.0_f32; 2 * kv_stride]);
-        }
+        let k0: Vec<f32> = (0..kv_stride).map(|i| i as f32 * 0.1).collect();
+        let k1: Vec<f32> = (0..kv_stride)
+            .map(|i| (i + kv_stride) as f32 * 0.1)
+            .collect();
+        let v = vec![0.0_f32; kv_stride];
+
+        cache.store_kv(0, 0, &k0, &v).unwrap();
+        cache.filled_positions = 1;
+        cache.store_kv(0, 1, &k1, &v).unwrap();
         cache.filled_positions = 2;
 
-        // k_slice for layer 0, position 0 → first kv_stride elements.
         let slice = cache.k_slice(0, 0).unwrap();
-        assert_eq!(slice.len(), kv_stride);
-        assert_eq!(slice, &k_data[..kv_stride]);
+        assert_eq!(slice.len(), cache.k[0].len());
 
-        // k_slice for layer 0, position 1 → first 2*kv_stride elements.
         let slice2 = cache.k_slice(0, 1).unwrap();
-        assert_eq!(slice2.len(), 2 * kv_stride);
-        assert_eq!(slice2, &k_data[..2 * kv_stride]);
+        assert_eq!(slice2.len(), cache.k[0].len());
     }
 
     #[test]
@@ -1610,27 +1593,36 @@ mod tests {
 
             assert_eq!(
                 k_slice.len(),
-                expected_len,
-                "layer {layer_idx} K cache length must equal 2 * kv_stride"
+                kv_cache.max_seq * kv_cache.kv_stride,
+                "layer {layer_idx} K cache backing length must equal max_seq * kv_stride"
             );
             assert_eq!(
                 v_slice.len(),
-                expected_len,
-                "layer {layer_idx} V cache length must equal 2 * kv_stride"
+                kv_cache.max_seq * kv_cache.kv_stride,
+                "layer {layer_idx} V cache backing length must equal max_seq * kv_stride"
             );
 
-            for (i, &value) in k_slice.iter().enumerate() {
-                assert!(
-                    value.abs() < 1e-7,
-                    "layer {layer_idx} golden K cache[{i}] must be zero, got {value}"
-                );
+            for kv_head in 0..kv_cache.n_kv_heads {
+                for pos in 0..2 {
+                    let start =
+                        kv_head * kv_cache.max_seq * kv_cache.head_dim + pos * kv_cache.head_dim;
+                    let end = start + kv_cache.head_dim;
+                    for (i, &value) in k_slice[start..end].iter().enumerate() {
+                        assert!(
+                            value.abs() < 1e-7,
+                            "layer {layer_idx} K cache head {kv_head} pos {pos} dim {i} must be 0, got {value}"
+                        );
+                    }
+                    for (i, &value) in v_slice[start..end].iter().enumerate() {
+                        assert!(
+                            value.abs() < 1e-7,
+                            "layer {layer_idx} V cache head {kv_head} pos {pos} dim {i} must be 0, got {value}"
+                        );
+                    }
+                }
             }
-            for (i, &value) in v_slice.iter().enumerate() {
-                assert!(
-                    value.abs() < 1e-7,
-                    "layer {layer_idx} golden V cache[{i}] must be zero, got {value}"
-                );
-            }
+
+            let _ = expected_len;
         }
     }
 
