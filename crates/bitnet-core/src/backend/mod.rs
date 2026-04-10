@@ -419,6 +419,95 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Fused squared ReLU gate: `out[i] = max(0, gate[i])² * up[i]`.
+    ///
+    /// Combines the squared ReLU activation and element-wise gate multiplication
+    /// into a single pass, eliminating an intermediate buffer traversal.
+    ///
+    /// # Shapes
+    /// All three slices must have the same length (typically `intermediate_size`).
+    ///
+    /// # Errors
+    /// Returns `Err` if slice lengths differ.
+    fn sqrelu_gate(&self, gate: &[f32], up: &[f32], out: &mut [f32]) -> Result<()> {
+        if gate.len() != up.len() || gate.len() != out.len() {
+            return Err(crate::error::BitNetError::shape(
+                format!("gate.len() == up.len() == out.len() = {}", gate.len()),
+                format!("up.len()={}, out.len()={}", up.len(), out.len()),
+            ));
+        }
+        for i in 0..gate.len() {
+            let r = gate[i].max(0.0);
+            out[i] = r * r * up[i];
+        }
+        Ok(())
+    }
+
+    /// Ternary GEMV with pre-quantised i8 activation input.
+    ///
+    /// Computes `output[i] = (Σ_j W[i,j] × activation_q[j]) × weight_scale × act_absmax / 127`.
+    ///
+    /// Unlike `ternary_gemv_with_activation_quant`, this method accepts an
+    /// already-quantised i8 activation vector and the pre-computed absmax,
+    /// enabling shared quantisation across multiple GEMV calls with the same input.
+    ///
+    /// # Shapes
+    /// Same as `ternary_gemv`.
+    ///
+    /// # Errors
+    /// Same as `ternary_gemv`, plus `QuantizationError` for invalid scales.
+    fn ternary_gemv_preq(
+        &self,
+        weight_packed: &[u8],
+        weight_scale: f32,
+        activation_q: &[i8],
+        act_absmax: f32,
+        output: &mut [f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<()>;
+
+    /// LM-head matrix–vector multiply with i8-quantised weight storage.
+    ///
+    /// Computes `output[v] = dot(weights_i8[v*hs..], hidden) * scales[v]`
+    /// for each vocabulary entry `v`.
+    ///
+    /// i8 storage halves memory bandwidth vs bf16 (328 MB vs 655 MB for 128K vocab).
+    ///
+    /// # i8 quantisation
+    /// Each row was quantised via absmax: `w_i8[i] = round(w_bf16[i] * 127 / max(|w_bf16_row|))`.
+    /// `scales[v] = max(|w_bf16_row[v]|) / 127.0`.
+    ///
+    /// # Default implementation
+    /// Uses Rayon for parallelism with scalar i8→f32 conversion.
+    ///
+    /// # Errors
+    /// Returns `Err` on shape mismatch.
+    fn lm_head_matmul_i8_into(
+        &self,
+        hidden: &[f32],
+        weights_i8: &[i8],
+        scales: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        debug_assert_eq!(hidden.len(), hidden_size);
+        debug_assert_eq!(weights_i8.len(), vocab_size * hidden_size);
+        debug_assert_eq!(scales.len(), vocab_size);
+        debug_assert_eq!(output.len(), vocab_size);
+        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
+            let row = &weights_i8[v * hidden_size..(v + 1) * hidden_size];
+            let mut acc = 0.0_f32;
+            for (&w, &h) in row.iter().zip(hidden.iter()) {
+                acc += w as f32 * h;
+            }
+            *out_elem = acc * scales[v];
+        });
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Device info
     // ------------------------------------------------------------------
@@ -539,6 +628,43 @@ impl Backend for Arc<dyn Backend> {
         hidden_size: usize,
     ) -> Result<()> {
         (**self).lm_head_matmul_bf16_into(hidden, weights_bf16, output, vocab_size, hidden_size)
+    }
+
+    fn sqrelu_gate(&self, gate: &[f32], up: &[f32], out: &mut [f32]) -> Result<()> {
+        (**self).sqrelu_gate(gate, up, out)
+    }
+
+    fn ternary_gemv_preq(
+        &self,
+        weight_packed: &[u8],
+        weight_scale: f32,
+        activation_q: &[i8],
+        act_absmax: f32,
+        output: &mut [f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<()> {
+        (**self).ternary_gemv_preq(
+            weight_packed,
+            weight_scale,
+            activation_q,
+            act_absmax,
+            output,
+            out_features,
+            in_features,
+        )
+    }
+
+    fn lm_head_matmul_i8_into(
+        &self,
+        hidden: &[f32],
+        weights_i8: &[i8],
+        scales: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        (**self).lm_head_matmul_i8_into(hidden, weights_i8, scales, output, vocab_size, hidden_size)
     }
 
     fn device_name(&self) -> &str {

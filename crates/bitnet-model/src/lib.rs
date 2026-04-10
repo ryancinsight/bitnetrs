@@ -77,6 +77,7 @@ pub mod device;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+use bitnet_core::quant::absmax::absmax_quantize_row_into;
 use bitnet_cpu::simd::axpy_f32_fast;
 use tracing::{debug, instrument, trace};
 
@@ -352,6 +353,9 @@ struct ScratchBuffers {
     /// Flat hidden-state buffer for single-token decode path.
     /// Avoids `Vec<Vec<f32>>` allocation when seq_len == 1.
     h_single: Vec<f32>,
+    /// Shared i8 activation quantisation scratch buffer.
+    /// Reused across QKV and Gate+Up projections to avoid redundant quantisation.
+    quant_buf: Vec<i8>,
 }
 
 impl ScratchBuffers {
@@ -377,6 +381,7 @@ impl ScratchBuffers {
             final_normed: vec![0.0_f32; hidden_size],
             logits: vec![0.0_f32; config.vocab_size],
             h_single: vec![0.0_f32; hidden_size],
+            quant_buf: vec![0i8; hidden_size.max(ffn_dim)],
         }
     }
 }
@@ -627,36 +632,48 @@ impl BitNetModel {
                         format!("layer {layer_idx}, tok {tok_offset}: attention_norm")
                     })?;
 
-                // ── Q projection ──────────────────────────────────────────────
+                // ── Shared activation quantisation for Q/K/V ──────────────
+                // Quantise h_norm once; reuse for all three projections.
+                let q_scale = absmax_quantize_row_into(
+                    &scratch.h_norm,
+                    &mut scratch.quant_buf[..hidden_size],
+                )
+                .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: qkv quant"))?;
+                let act_absmax_qkv = q_scale * 127.0;
+
+                // Q projection (pre-quantised)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.q_proj.data,
                         layer.q_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.q_buf,
                         q_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: q_proj"))?;
 
-                // ── K projection ──────────────────────────────────────────────
+                // K projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.k_proj.data,
                         layer.k_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.k_buf,
                         kv_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: k_proj"))?;
 
-                // ── V projection ──────────────────────────────────────────────
+                // V projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.v_proj.data,
                         layer.v_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.v_buf,
                         kv_dim,
                         hidden_size,
@@ -733,41 +750,44 @@ impl BitNetModel {
                     .rms_norm(h, &layer.ffn_norm, eps, &mut scratch.ffn_h_norm)
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: ffn_norm"))?;
 
-                // ── Gate projection ────────────────────────────────────────────
+                // ── Shared activation quantisation for Gate+Up ────────────
+                let ffn_q_scale = absmax_quantize_row_into(
+                    &scratch.ffn_h_norm,
+                    &mut scratch.quant_buf[..hidden_size],
+                )
+                .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: gate_up quant"))?;
+                let act_absmax_ffn = ffn_q_scale * 127.0;
+
+                // Gate projection (pre-quantised)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.gate_proj.data,
                         layer.gate_proj.scale,
-                        &scratch.ffn_h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_ffn,
                         &mut scratch.gate,
                         ffn_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: gate_proj"))?;
 
-                // ── Up projection ──────────────────────────────────────────────
+                // Up projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.up_proj.data,
                         layer.up_proj.scale,
-                        &scratch.ffn_h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_ffn,
                         &mut scratch.up,
                         ffn_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: up_proj"))?;
 
-                // ── Squared ReLU activation on gate ────────────────────────────
+                // Fused squared ReLU gate: inner = sqrelu(gate) ⊙ up
                 self.backend
-                    .squared_relu(&mut scratch.gate)
-                    .with_context(|| {
-                        format!("layer {layer_idx}, tok {tok_offset}: squared_relu")
-                    })?;
-
-                // ── Gate ⊙ up (element-wise multiply) ─────────────────────────
-                self.backend
-                    .elementwise_mul(&scratch.gate, &scratch.up, &mut scratch.inner)
-                    .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: gate * up"))?;
+                    .sqrelu_gate(&scratch.gate, &scratch.up, &mut scratch.inner)
+                    .with_context(|| format!("layer {layer_idx}, tok {tok_offset}: sqrelu_gate"))?;
 
                 // ── FFN sub-layer norm ─────────────────────────────────────────
                 self.backend
@@ -824,14 +844,15 @@ impl BitNetModel {
         // LM head (unquantised matmul: lm_head is weight-tied to embed_tokens).
         // logits[v] = Σ_h  lm_head[v * hidden_size + h] * final_normed[h]
         self.backend
-            .lm_head_matmul_bf16_into(
+            .lm_head_matmul_i8_into(
                 final_normed,
-                &self.weights.lm_head,
+                &self.weights.lm_head_i8,
+                &self.weights.lm_head_scales,
                 &mut scratch.logits,
                 self.config.vocab_size,
                 hidden_size,
             )
-            .context("lm_head_bf16")?;
+            .context("lm_head_i8")?;
 
         debug!(vocab_size = scratch.logits.len(), "Forward pass complete");
 
@@ -931,36 +952,48 @@ impl BitNetModel {
                     .rms_norm(h, &layer.attention_norm, eps, &mut scratch.h_norm)
                     .with_context(|| format!("layer {layer_idx}: attention_norm"))?;
 
-                // Q projection
+                // ── Shared activation quantisation for Q/K/V ──────────────
+                // Quantise h_norm once; reuse for all three projections.
+                let q_scale = absmax_quantize_row_into(
+                    &scratch.h_norm,
+                    &mut scratch.quant_buf[..hidden_size],
+                )
+                .with_context(|| format!("layer {layer_idx}: qkv quant"))?;
+                let act_absmax_qkv = q_scale * 127.0;
+
+                // Q projection (pre-quantised)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.q_proj.data,
                         layer.q_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.q_buf,
                         q_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}: q_proj"))?;
 
-                // K projection
+                // K projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.k_proj.data,
                         layer.k_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.k_buf,
                         kv_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}: k_proj"))?;
 
-                // V projection
+                // V projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.v_proj.data,
                         layer.v_proj.scale,
-                        &scratch.h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_qkv,
                         &mut scratch.v_buf,
                         kv_dim,
                         hidden_size,
@@ -1032,39 +1065,44 @@ impl BitNetModel {
                     .rms_norm(h, &layer.ffn_norm, eps, &mut scratch.ffn_h_norm)
                     .with_context(|| format!("layer {layer_idx}: ffn_norm"))?;
 
-                // Gate projection
+                // ── Shared activation quantisation for Gate+Up ────────────
+                let ffn_q_scale = absmax_quantize_row_into(
+                    &scratch.ffn_h_norm,
+                    &mut scratch.quant_buf[..hidden_size],
+                )
+                .with_context(|| format!("layer {layer_idx}: gate_up quant"))?;
+                let act_absmax_ffn = ffn_q_scale * 127.0;
+
+                // Gate projection (pre-quantised)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.gate_proj.data,
                         layer.gate_proj.scale,
-                        &scratch.ffn_h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_ffn,
                         &mut scratch.gate,
                         ffn_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}: gate_proj"))?;
 
-                // Up projection
+                // Up projection (pre-quantised, shared quant)
                 self.backend
-                    .ternary_gemv_with_activation_quant(
+                    .ternary_gemv_preq(
                         &layer.up_proj.data,
                         layer.up_proj.scale,
-                        &scratch.ffn_h_norm,
+                        &scratch.quant_buf[..hidden_size],
+                        act_absmax_ffn,
                         &mut scratch.up,
                         ffn_dim,
                         hidden_size,
                     )
                     .with_context(|| format!("layer {layer_idx}: up_proj"))?;
 
-                // Squared ReLU
+                // Fused squared ReLU gate: inner = sqrelu(gate) ⊙ up
                 self.backend
-                    .squared_relu(&mut scratch.gate)
-                    .with_context(|| format!("layer {layer_idx}: squared_relu"))?;
-
-                // Gate ⊙ up
-                self.backend
-                    .elementwise_mul(&scratch.gate, &scratch.up, &mut scratch.inner)
-                    .with_context(|| format!("layer {layer_idx}: gate * up"))?;
+                    .sqrelu_gate(&scratch.gate, &scratch.up, &mut scratch.inner)
+                    .with_context(|| format!("layer {layer_idx}: sqrelu_gate"))?;
 
                 // FFN sub-layer norm
                 self.backend
@@ -1108,14 +1146,15 @@ impl BitNetModel {
                 .context("final_norm")?;
 
             self.backend
-                .lm_head_matmul_bf16_into(
+                .lm_head_matmul_i8_into(
                     &scratch.final_normed,
-                    &self.weights.lm_head,
+                    &self.weights.lm_head_i8,
+                    &self.weights.lm_head_scales,
                     output_logits,
                     self.config.vocab_size,
                     hidden_size,
                 )
-                .context("lm_head_bf16")?;
+                .context("lm_head_i8")?;
 
             debug!(
                 vocab_size = output_logits.len(),
@@ -1468,12 +1507,40 @@ mod tests {
         let lm_head: Arc<Vec<half::bf16>> = Arc::clone(&embed_tokens); // true weight tying
         let final_norm = ones_norm(h);
 
+        // i8-quantised lm_head (per-row absmax)
+        let mut lm_head_i8_data = vec![0i8; v * h];
+        let mut lm_head_scales_data = vec![0.0f32; v];
+        for row in 0..v {
+            let start = row * h;
+            let end = start + h;
+            let mut max_abs: f32 = 0.0;
+            for &w in &embed_tokens[start..end] {
+                let a = f32::from(w).abs();
+                if a > max_abs {
+                    max_abs = a;
+                }
+            }
+            if max_abs < 1e-10 {
+                max_abs = 1e-10;
+            }
+            let inv_max = 127.0 / max_abs;
+            lm_head_scales_data[row] = max_abs / 127.0;
+            for (i, &w) in embed_tokens[start..end].iter().enumerate() {
+                let val = f32::from(w);
+                lm_head_i8_data[start + i] = (val * inv_max).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+        let lm_head_i8 = Arc::new(lm_head_i8_data);
+        let lm_head_scales = Arc::new(lm_head_scales_data);
+
         ModelWeights {
             config: config.clone(),
             embed_tokens,
             layers,
             final_norm,
             lm_head,
+            lm_head_i8,
+            lm_head_scales,
         }
     }
 

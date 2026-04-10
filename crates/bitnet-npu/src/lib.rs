@@ -6,9 +6,10 @@
 //!
 //! On Windows, modern AI-capable hardware exposes a Neural Processing Unit (NPU)
 //! that can be accessed via **DirectML** — Microsoft's GPU/NPU compute API.
-//! wgpu on Windows supports DirectML-backed adapters, so this crate probes the
-//! adapter list for NPU-like devices and, when found, uses a wgpu compute path
-//! optimised for low-power AI inference.
+//! The concrete wgpu implementation now lives behind the GPU facade crate, so
+//! this crate probes the adapter list for NPU-like devices and, when found,
+//! uses the facade to construct a wgpu-backed GPU compute path optimised for
+//! low-power AI inference.
 //!
 //! When no NPU is detected (or on non-Windows platforms), the backend falls back
 //! transparently to [`bitnet_cpu::CpuBackend`] with no change to the API contract.
@@ -33,7 +34,7 @@
 //! All [`Backend`] trait methods delegate to whichever inner backend was selected
 //! at construction time:
 //! - [`NpuBackend::new`]: Attempt NPU detection; return an `NpuBackend` wrapping
-//!   either the NPU (wgpu) backend or the CPU fallback.
+//!   either the NPU (GPU facade → wgpu backend) or the CPU fallback.
 //! - All compute operations: pass-through to `inner: Arc<dyn Backend>`.
 //!
 //! ## Invariants
@@ -93,8 +94,8 @@ use detect::{detect_npu, NpuInfo};
 pub struct NpuBackend {
     /// The inner backend performing the actual compute.
     ///
-    /// Either a `bitnet_gpu::GpuBackend` (when an NPU adapter was detected)
-    /// or a `bitnet_cpu::CpuBackend` (fallback).
+    /// Either a GPU facade backend backed by `wgpu` (when an NPU adapter was
+    /// detected) or a `bitnet_cpu::CpuBackend` (fallback).
     inner: Arc<dyn Backend>,
 
     /// Human-readable device name for diagnostics.
@@ -123,9 +124,9 @@ impl std::fmt::Debug for NpuBackend {
 impl NpuBackend {
     /// Create a new `NpuBackend`.
     ///
-    /// Performs NPU detection via [`detect_npu`].  If an NPU adapter is found
-    /// at index `device_id`, attempts to initialise a wgpu compute backend
-    /// targeting that adapter.  If NPU detection fails or initialisation
+    /// Performs NPU detection via [`detect_npu`]. If an NPU adapter is found
+    /// at index `device_id`, attempts to initialise a GPU facade backend
+    /// targeting that adapter. If NPU detection fails or initialisation
     /// errors, silently falls back to [`bitnet_cpu::CpuBackend`].
     ///
     /// # Arguments
@@ -164,11 +165,11 @@ impl NpuBackend {
             debug!("No NPU detected on this system; will use CPU fallback");
         }
 
-        // ── Step 2: Attempt NPU-backed wgpu initialisation ────────────────
+        // ── Step 2: Attempt NPU-backed GPU facade initialisation ──────────
         //
-        // On Windows, we attempt to create a wgpu backend using the detected
-        // NPU adapter.  On other platforms, or if detection found nothing,
-        // we skip directly to CPU fallback.
+        // On Windows, we attempt to create a GPU facade backend using the
+        // detected NPU adapter. On other platforms, or if detection found
+        // nothing, we skip directly to CPU fallback.
         #[cfg(target_os = "windows")]
         if let Some(ref npu_info) = detected {
             debug!(
@@ -176,10 +177,9 @@ impl NpuBackend {
                 "Attempting wgpu/DirectML NPU backend initialisation"
             );
 
-            // The adapter_index from detection is the wgpu adapter index.
-            // We use it directly with the GPU backend (which uses the same
-            // wgpu adapter enumeration).
-            let gpu_result = bitnet_gpu::GpuBackend::new_blocking(npu_info.adapter_index);
+            // The adapter_index from detection is the GPU adapter index used
+            // by the facade's wgpu backend implementation.
+            let gpu_result = bitnet_gpu::create_wgpu_backend_blocking(npu_info.adapter_index);
 
             match gpu_result {
                 Ok(gpu_backend) => {
@@ -197,20 +197,23 @@ impl NpuBackend {
                     warn!(
                         error = %e,
                         npu = %npu_info.name,
-                        "wgpu/DirectML NPU initialisation failed; falling back to CPU"
+                        "GPU facade / DirectML NPU initialisation failed; falling back to CPU"
                     );
                 }
             }
         }
 
-        // On non-Windows platforms, also use GPU if an NPU-like adapter is found.
+        // On non-Windows platforms, also use the GPU facade if an NPU-like
+        // adapter is found.
         #[cfg(not(target_os = "windows"))]
         if let Some(ref npu_info) = detected {
             debug!(
                 npu_name = %npu_info.name,
                 "Non-Windows: attempting GPU backend for NPU-like adapter"
             );
-            if let Ok(gpu_backend) = bitnet_gpu::GpuBackend::new_blocking(npu_info.adapter_index) {
+            if let Ok(gpu_backend) =
+                bitnet_gpu::create_wgpu_backend_blocking(npu_info.adapter_index)
+            {
                 let name = format!("NPU ({})", npu_info.name);
                 info!(device = %name, "NPU-like backend initialised via wgpu");
                 let inner: Arc<dyn Backend> = gpu_backend.into_arc();
@@ -454,6 +457,31 @@ impl Backend for NpuBackend {
     ) -> Result<()> {
         self.inner
             .lm_head_matmul_into(hidden, weights, output, vocab_size, hidden_size)
+    }
+
+    /// Ternary GEMV with pre-quantised i8 activation (NPU stub → inner backend).
+    ///
+    /// NPU-native pre-quantised GEMV is not yet implemented; delegates to the
+    /// inner backend (DirectML or CPU fallback).
+    fn ternary_gemv_preq(
+        &self,
+        weight_packed: &[u8],
+        weight_scale: f32,
+        activation_q: &[i8],
+        act_absmax: f32,
+        output: &mut [f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<()> {
+        self.inner.ternary_gemv_preq(
+            weight_packed,
+            weight_scale,
+            activation_q,
+            act_absmax,
+            output,
+            out_features,
+            in_features,
+        )
     }
 
     // ------------------------------------------------------------------

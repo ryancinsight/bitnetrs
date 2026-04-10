@@ -1,18 +1,14 @@
 [package]
-name    = "bitnet-gpu"
+name = "bitnet-gpu"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "GPU backend for BitNet b1.58 inference via wgpu (Vulkan/Metal/DX12/WebGPU)"
+description = "GPU backend facade and abstraction layer for BitNet b1.58 inference"
 
 [dependencies]
 bitnet-core.workspace = true
-bitnet-cpu.workspace  = true
-anyhow.workspace      = true
-thiserror.workspace   = true
-tracing.workspace     = true
-bytemuck.workspace    = true
-wgpu.workspace        = true
-futures.workspace     = true
-pollster.workspace    = true
+bitnet-gpu-wgpu.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

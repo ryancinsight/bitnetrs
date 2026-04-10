@@ -265,6 +265,78 @@ pub struct ModelWeights {
     /// Shared Arc with `embed_tokens` — no extra allocation.
     /// Semantics: `logits[v] = dot(lm_head[v], hidden)`.
     pub lm_head: Arc<Vec<half::bf16>>,
+
+    /// i8-quantised embedding table for lm_head matmul (halved bandwidth vs bf16).
+    ///
+    /// Each row was quantised via absmax: `w_i8[i] = round(w_bf16[i] * 127 / max(|w_row|))`.
+    /// Shape: `[vocab_size * hidden_size]`, row-major.
+    ///
+    /// Paired with `lm_head_scales` for dequantisation:
+    /// `logits[v] = dot(lm_head_i8[v*hs..(v+1)*hs], hidden) * lm_head_scales[v]`.
+    pub lm_head_i8: Arc<Vec<i8>>,
+
+    /// Per-row dequantisation scales for `lm_head_i8`.
+    ///
+    /// `lm_head_scales[v] = max(|embed_row[v]|) / 127.0`.
+    /// Shape: `[vocab_size]`.
+    pub lm_head_scales: Arc<Vec<f32>>,
+}
+
+// ---------------------------------------------------------------------------
+// Quantisation helpers
+// ---------------------------------------------------------------------------
+
+/// Quantise a bf16 embedding table to i8 with per-row absmax scaling.
+///
+/// For each row `v` of `hidden_size` elements:
+/// - `scale[v] = max(|row[v]|) / 127.0`
+/// - `i8_val[i] = clamp(round(bf16_val[i] / scale[v] * 127.0 / max_abs_row), -128, 127)`
+///
+/// Returns `(i8_data, scales)` where `i8_data` has shape `[n_rows * row_len]`
+/// and `scales` has shape `[n_rows]`.
+fn quantize_bf16_rows_to_i8(
+    bf16_data: &[half::bf16],
+    n_rows: usize,
+    row_len: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    debug_assert_eq!(bf16_data.len(), n_rows * row_len);
+
+    let mut i8_data = vec![0i8; n_rows * row_len];
+    let mut scales = vec![0.0f32; n_rows];
+
+    for row_idx in 0..n_rows {
+        let start = row_idx * row_len;
+        let end = start + row_len;
+        let row_bf16 = &bf16_data[start..end];
+        let row_i8 = &mut i8_data[start..end];
+
+        // Find absmax of the row (convert bf16 → f32 on the fly)
+        let mut max_abs: f32 = 0.0;
+        for &w in row_bf16 {
+            let val = f32::from(w);
+            let abs_val = val.abs();
+            if abs_val > max_abs {
+                max_abs = abs_val;
+            }
+        }
+
+        // Avoid division by zero: use a minimum scale
+        if max_abs < 1e-10 {
+            max_abs = 1e-10;
+        }
+
+        let inv_max = 127.0 / max_abs;
+        scales[row_idx] = max_abs / 127.0;
+
+        // Quantise each element
+        for (i, &w) in row_bf16.iter().enumerate() {
+            let val = f32::from(w);
+            let q = (val * inv_max).round().clamp(-128.0, 127.0) as i8;
+            row_i8[i] = q;
+        }
+    }
+
+    (i8_data, scales)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +449,17 @@ pub fn load_weights_from_bf16(
 
     debug!("lm_head set (weight-tied to embed_tokens, shared Arc)");
 
+    // i8-quantised embedding for lm_head matmul (halved bandwidth vs bf16)
+    let (lm_head_i8_data, lm_head_scales_data) =
+        quantize_bf16_rows_to_i8(&embed_tokens, config.vocab_size, config.hidden_size);
+    let lm_head_i8 = Arc::new(lm_head_i8_data);
+    let lm_head_scales = Arc::new(lm_head_scales_data);
+    debug!(
+        i8_bytes = lm_head_i8.len(),
+        n_scales = lm_head_scales.len(),
+        "lm_head i8 quantisation complete"
+    );
+
     // ── Step 3: Load per-layer weights ─────────────────────────────────────
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
 
@@ -397,6 +480,8 @@ pub fn load_weights_from_bf16(
         layers,
         final_norm,
         lm_head,
+        lm_head_i8,
+        lm_head_scales,
     })
 }
 
@@ -656,6 +741,12 @@ pub fn load_weights_from_packed(
 
     let lm_head = Arc::clone(&embed_tokens); // weight-tied, no extra allocation
 
+    // i8-quantised embedding for lm_head matmul
+    let (lm_head_i8_data, lm_head_scales_data) =
+        quantize_bf16_rows_to_i8(&embed_tokens, config.vocab_size, config.hidden_size);
+    let lm_head_i8 = Arc::new(lm_head_i8_data);
+    let lm_head_scales = Arc::new(lm_head_scales_data);
+
     // ── Per-layer tensors ──────────────────────────────────────────────────
     let head_dim = config.head_dim();
     let q_rows = config.num_key_value_heads * head_dim;
@@ -732,6 +823,8 @@ pub fn load_weights_from_packed(
         layers,
         final_norm,
         lm_head,
+        lm_head_i8,
+        lm_head_scales,
     })
 }
 

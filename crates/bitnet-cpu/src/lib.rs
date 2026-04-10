@@ -431,11 +431,20 @@ impl Backend for CpuBackend {
         debug_assert_eq!(weights.len(), vocab_size * hidden_size);
         debug_assert_eq!(output.len(), vocab_size);
 
-        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
-            let row_start = v * hidden_size;
-            let row = &weights[row_start..row_start + hidden_size];
-            *out_elem = simd::dot_f32_f32_fast(row, hidden);
-        });
+        const ROWS_PER_CHUNK: usize = 256;
+
+        output
+            .par_chunks_mut(ROWS_PER_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let row_base = chunk_idx * ROWS_PER_CHUNK;
+                for (row_offset, out_elem) in out_chunk.iter_mut().enumerate() {
+                    let v = row_base + row_offset;
+                    let row_start = v * hidden_size;
+                    let row = &weights[row_start..row_start + hidden_size];
+                    *out_elem = simd::dot_f32_f32_fast(row, hidden);
+                }
+            });
         Ok(())
     }
 
@@ -461,11 +470,107 @@ impl Backend for CpuBackend {
         // Cast bf16 slice to u16 slice (bytemuck: same bits, zero-copy).
         let weights_u16 = cast_slice::<half::bf16, u16>(weights_bf16);
 
-        output.par_iter_mut().enumerate().for_each(|(v, out_elem)| {
-            let row_start = v * hidden_size;
-            let row = &weights_u16[row_start..row_start + hidden_size];
-            *out_elem = simd::dot_f32_bf16w_fast(row, hidden);
-        });
+        const ROWS_PER_CHUNK: usize = 256;
+
+        output
+            .par_chunks_mut(ROWS_PER_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let row_base = chunk_idx * ROWS_PER_CHUNK;
+                for (row_offset, out_elem) in out_chunk.iter_mut().enumerate() {
+                    let v = row_base + row_offset;
+                    let row_start = v * hidden_size;
+                    let row = &weights_u16[row_start..row_start + hidden_size];
+                    *out_elem = simd::dot_f32_bf16w_fast(row, hidden);
+                }
+            });
+        Ok(())
+    }
+
+    /// Fused squared ReLU gate with SIMD acceleration.
+    ///
+    /// Uses `sqrelu_gate_f32_fast` (AVX2 when available).
+    #[instrument(level = "trace", skip(self, gate, up, out), fields(len = gate.len()))]
+    fn sqrelu_gate(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+    ) -> bitnet_core::error::Result<()> {
+        use bitnet_core::error::BitNetError;
+        if gate.len() != up.len() || gate.len() != out.len() {
+            return Err(BitNetError::shape(
+                format!("gate.len() == up.len() == out.len() = {}", gate.len()),
+                format!("up.len()={}, out.len()={}", up.len(), out.len()),
+            ));
+        }
+        simd::sqrelu_gate_f32_fast(gate, up, out);
+        Ok(())
+    }
+
+    /// Ternary GEMV with pre-quantised i8 activation (shared quant path).
+    ///
+    /// Delegates to `gemv::ternary_gemv_quantised` with pre-computed activation.
+    #[instrument(
+        level = "trace",
+        skip(self, weight_packed, activation_q, output),
+        fields(out_features, in_features, weight_scale)
+    )]
+    fn ternary_gemv_preq(
+        &self,
+        weight_packed: &[u8],
+        weight_scale: f32,
+        activation_q: &[i8],
+        act_absmax: f32,
+        output: &mut [f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> bitnet_core::error::Result<()> {
+        gemv::ternary_gemv_quantised(
+            weight_packed,
+            weight_scale,
+            activation_q,
+            act_absmax,
+            output,
+            out_features,
+            in_features,
+        )
+    }
+
+    /// LM-head i8 matmul with AVX2+FMA SIMD and Rayon parallelism.
+    ///
+    /// Converts i8 weights → f32 on the fly via `dot_f32_i8w_fast`,
+    /// then applies per-row dequantisation scale.
+    fn lm_head_matmul_i8_into(
+        &self,
+        hidden: &[f32],
+        weights_i8: &[i8],
+        scales: &[f32],
+        output: &mut [f32],
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> bitnet_core::error::Result<()> {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(hidden.len(), hidden_size);
+        debug_assert_eq!(weights_i8.len(), vocab_size * hidden_size);
+        debug_assert_eq!(scales.len(), vocab_size);
+        debug_assert_eq!(output.len(), vocab_size);
+
+        const ROWS_PER_CHUNK: usize = 256;
+
+        output
+            .par_chunks_mut(ROWS_PER_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let row_base = chunk_idx * ROWS_PER_CHUNK;
+                for (row_offset, out_elem) in out_chunk.iter_mut().enumerate() {
+                    let v = row_base + row_offset;
+                    let row_start = v * hidden_size;
+                    let row = &weights_i8[row_start..row_start + hidden_size];
+                    *out_elem = simd::dot_f32_i8w_fast(row, hidden) * scales[v];
+                }
+            });
         Ok(())
     }
 

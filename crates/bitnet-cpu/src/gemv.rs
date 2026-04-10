@@ -152,6 +152,7 @@ pub fn ternary_gemv_f32(
     // `weight_scale` — all are `Sync`, so no data races can occur.
     output
         .par_iter_mut()
+        .with_min_len(32)
         .enumerate()
         .for_each(|(row_idx, out_elem)| {
             let row_start = row_idx * packed_cols;
@@ -297,6 +298,7 @@ pub fn ternary_gemv_quantised(
 
     output
         .par_iter_mut()
+        .with_min_len(32)
         .enumerate()
         .for_each(|(row_idx, out_elem)| {
             let row_start = row_idx * packed_cols;

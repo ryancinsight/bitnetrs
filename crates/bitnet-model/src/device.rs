@@ -9,11 +9,11 @@
 //!
 //! # Device Resolution Order
 //!
-//! | [`Device`] variant | Concrete type             | Crate          |
-//! |--------------------|--------------------------|----------------|
-//! | `Cpu { threads }`  | [`CpuBackend`]           | `bitnet-cpu`   |
-//! | `Gpu { device_id }`| [`GpuBackend`]           | `bitnet-gpu`   |
-//! | `Npu { device_id }`| [`NpuBackend`]           | `bitnet-npu`   |
+//! | [`Device`] variant | Concrete type             | Crate               |
+//! |--------------------|--------------------------|---------------------|
+//! | `Cpu { threads }`  | [`CpuBackend`]           | `bitnet-cpu`        |
+//! | `Gpu { device_id }`| [`GpuBackend`]           | `bitnet-gpu-wgpu`   |
+//! | `Npu { device_id }`| [`NpuBackend`]           | `bitnet-npu`        |
 //!
 //! # Fallback Behaviour
 //!

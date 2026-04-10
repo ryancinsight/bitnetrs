@@ -1,0 +1,28 @@
+[package]
+name = "bitnet-gpu-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CUDA backend boundary for BitNet b1.58 inference"
+
+[dependencies]
+bitnet-core.workspace = true
+bitnet-cpu.workspace = true
+bitnet-gpu.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+
+cutile = { git = "https://github.com/NVlabs/cutile-rs", package = "cutile", optional = true }
+cuda-async = { git = "https://github.com/NVlabs/cutile-rs", package = "cuda-async", optional = true }
+cuda-core = { git = "https://github.com/NVlabs/cutile-rs", package = "cuda-core", optional = true }
+
+[features]
+default = []
+cuda = ["dep:cutile", "dep:cuda-async", "dep:cuda-core"]
+
+[lints.clippy]
+all = "warn"

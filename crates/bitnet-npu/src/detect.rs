@@ -130,8 +130,8 @@ impl std::fmt::Display for NpuAdapterType {
 ///
 /// Returned by [`detect_npu`] when an NPU is found.  The `adapter_index` field
 /// is a direct index into the wgpu adapter list and can be passed to
-/// `bitnet_gpu::GpuBackend::new_blocking(adapter_index)` to create a backend
-/// targeting the NPU.
+/// `bitnet_gpu::create_wgpu_backend_blocking(adapter_index)` to create a backend
+/// targeting the NPU through the GPU facade.
 ///
 /// # Invariants
 ///
@@ -161,7 +161,8 @@ pub struct NpuInfo {
 
     /// Zero-based index into the sorted wgpu adapter list at detection time.
     ///
-    /// Pass this to `GpuBackend::new_blocking(adapter_index)` to target the NPU.
+    /// Pass this to `bitnet_gpu::create_wgpu_backend_blocking(adapter_index)` to
+    /// target the NPU through the GPU facade.
     pub adapter_index: u32,
 
     /// PCI vendor ID (0 if unavailable or non-PCI device).

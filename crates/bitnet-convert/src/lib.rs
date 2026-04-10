@@ -557,12 +557,43 @@ pub fn convert_hf_packed_to_canonical(
         });
     }
 
+    // i8-quantised embedding for lm_head matmul (per-row absmax)
+    let (lm_head_i8, lm_head_scales) = {
+        let n_rows = config.vocab_size;
+        let row_len = config.hidden_size;
+        let bf16_data: &[half::bf16] = &embed_tokens;
+        let mut i8_data = vec![0i8; n_rows * row_len];
+        let mut scales = vec![0.0f32; n_rows];
+        for row_idx in 0..n_rows {
+            let start = row_idx * row_len;
+            let end = start + row_len;
+            let mut max_abs: f32 = 0.0;
+            for &w in &bf16_data[start..end] {
+                let a = f32::from(w).abs();
+                if a > max_abs {
+                    max_abs = a;
+                }
+            }
+            if max_abs < 1e-10 {
+                max_abs = 1e-10;
+            }
+            let inv_max = 127.0 / max_abs;
+            scales[row_idx] = max_abs / 127.0;
+            for (i, &w) in bf16_data[start..end].iter().enumerate() {
+                i8_data[start + i] = (f32::from(w) * inv_max).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+        (Arc::new(i8_data), Arc::new(scales))
+    };
+
     let weights = ModelWeights {
         config: config.clone(),
         embed_tokens: Arc::clone(&embed_tokens),
         layers,
         final_norm,
         lm_head: embed_tokens,
+        lm_head_i8,
+        lm_head_scales,
     };
 
     info!(
@@ -907,12 +938,17 @@ mod tests {
             half::bf16::from_f32(0.0);
             cfg.vocab_size * cfg.hidden_size
         ]);
+        // i8-quantised lm_head: all-zero embeddings → all-zero i8, minimum scales
+        let lm_head_i8 = Arc::new(vec![0i8; cfg.vocab_size * cfg.hidden_size]);
+        let lm_head_scales = Arc::new(vec![1e-10_f32 / 127.0; cfg.vocab_size]);
         let weights = ModelWeights {
             config: cfg.clone(),
             embed_tokens: Arc::clone(&embed_tokens),
             layers: Vec::new(),
             final_norm: vec![1.0; cfg.hidden_size],
             lm_head: embed_tokens,
+            lm_head_i8,
+            lm_head_scales,
         };
         let canonical = CanonicalModelWeights { weights };
         let runtime = convert_canonical_to_runtime(canonical.clone());

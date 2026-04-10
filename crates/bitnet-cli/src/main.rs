@@ -8,6 +8,7 @@
 //! - `download` — Download model weights from HuggingFace Hub.
 //! - `generate` — Generate text from a prompt (non-interactive).
 //! - `chat`     — Interactive multi-turn chat mode.
+//! - `bench`    — Deterministic throughput benchmark (tokens/second).
 //!
 //! ## Usage Examples
 //!
@@ -107,6 +108,15 @@ enum Commands {
     /// Example:
     ///   bitnet chat --model /path/to/model.safetensors --device gpu
     Chat(ChatArgs),
+
+    /// Deterministic throughput benchmark.
+    ///
+    /// Runs a fixed prompt through prefill, then generates a deterministic
+    /// sequence with greedy decoding (`top_k = 1`) and reports tokens/second.
+    ///
+    /// Example:
+    ///   bitnet bench --model /path/to/model.safetensors --prompt "Hello" --max-tokens 128
+    Bench(BenchArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +311,108 @@ struct GenerateArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark subcommand
+// ---------------------------------------------------------------------------
+
+/// Arguments for `bitnet bench`.
+#[derive(Debug, Parser)]
+struct BenchArgs {
+    /// Path to the `.safetensors` model checkpoint.
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        help = "Path to model.safetensors (packed or BF16 HuggingFace checkpoint)"
+    )]
+    model: PathBuf,
+
+    /// Text prompt used for prefill before decode benchmarking.
+    #[arg(
+        short,
+        long,
+        value_name = "TEXT",
+        help = "Input prompt to benchmark decode throughput from"
+    )]
+    prompt: String,
+
+    /// Compute device to use for inference.
+    #[arg(
+        short,
+        long,
+        value_enum,
+        default_value = "cpu",
+        value_name = "DEVICE",
+        help = "Compute device: cpu | gpu | npu"
+    )]
+    device: DeviceArg,
+
+    /// Number of CPU threads to use (0 = Rayon default).
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_name = "N",
+        help = "CPU thread count (0 = Rayon default)"
+    )]
+    threads: usize,
+
+    /// Optional CPU thread sweep range `START-END` for repeated benchmark runs.
+    ///
+    /// Only used with `--device cpu`. When provided, the benchmark runs once per
+    /// thread count in the inclusive range and reports tokens/second for each.
+    #[arg(
+        long,
+        value_name = "START-END",
+        help = "Inclusive CPU thread sweep range, e.g. 1-16"
+    )]
+    thread_sweep: Option<String>,
+
+    /// GPU adapter index when `--device gpu` is selected.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_name = "ID",
+        help = "GPU adapter index for --device gpu"
+    )]
+    gpu_id: u32,
+
+    /// Number of new tokens to generate during the benchmark.
+    #[arg(
+        long = "max-tokens",
+        default_value_t = 128,
+        value_name = "N",
+        help = "Number of tokens to generate for throughput measurement"
+    )]
+    max_tokens: usize,
+
+    /// Number of warmup runs before measured benchmark runs.
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_name = "N",
+        help = "Number of warmup runs before measurement (default 1)"
+    )]
+    warmup_runs: usize,
+
+    /// Number of measured benchmark runs to average.
+    #[arg(
+        long,
+        default_value_t = 3,
+        value_name = "N",
+        help = "Number of measured runs to average (default 3)"
+    )]
+    repeat_runs: usize,
+
+    /// RNG seed used for deterministic sampling configuration.
+    #[arg(
+        long,
+        default_value_t = 42,
+        value_name = "SEED",
+        help = "Random seed (kept for config completeness; greedy decode ignores it)"
+    )]
+    seed: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Chat subcommand
 // ---------------------------------------------------------------------------
 
@@ -431,6 +543,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Download(args) => run_download(args).await,
         Commands::Generate(args) => run_generate(args),
         Commands::Chat(args) => run_chat(args),
+        Commands::Bench(args) => run_bench(args),
     };
 
     if let Err(ref e) = result {
@@ -566,6 +679,172 @@ fn run_generate(args: GenerateArgs) -> anyhow::Result<()> {
         0.0
     };
     eprintln!("\n[{n_tokens} tokens in {elapsed:.1?} → {tokens_per_sec:.1} tok/s]");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// benchmark handler
+// ---------------------------------------------------------------------------
+
+fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
+    if !args.model.exists() {
+        return Err(anyhow!(
+            "Model file not found: {}\n\
+             Run `bitnet download` to fetch the weights first.",
+            args.model.display()
+        ));
+    }
+
+    if args.warmup_runs == 0 {
+        return Err(anyhow!("--warmup-runs must be >= 1"));
+    }
+    if args.repeat_runs == 0 {
+        return Err(anyhow!("--repeat-runs must be >= 1"));
+    }
+
+    let sampling = SamplingConfig {
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 1,
+        repetition_penalty: 1.0,
+        max_new_tokens: args.max_tokens,
+        seed: args.seed,
+    };
+    sampling
+        .validate()
+        .context("Invalid benchmark sampling parameters")?;
+
+    fn parse_thread_sweep(spec: &str) -> anyhow::Result<(usize, usize)> {
+        let (start, end) = spec
+            .split_once('-')
+            .ok_or_else(|| anyhow!("invalid --thread-sweep format '{spec}', expected START-END"))?;
+        let start = start
+            .parse::<usize>()
+            .with_context(|| format!("invalid thread sweep start '{start}'"))?;
+        let end = end
+            .parse::<usize>()
+            .with_context(|| format!("invalid thread sweep end '{end}'"))?;
+        if start == 0 || end == 0 {
+            return Err(anyhow!("--thread-sweep values must be >= 1"));
+        }
+        if start > end {
+            return Err(anyhow!(
+                "--thread-sweep start must be <= end, got {start}-{end}"
+            ));
+        }
+        Ok((start, end))
+    }
+
+    fn run_single_bench(
+        model: &std::path::Path,
+        prompt: &str,
+        sampling: &SamplingConfig,
+        device: Device,
+        warmup_runs: usize,
+        repeat_runs: usize,
+    ) -> anyhow::Result<(usize, f64, f64)> {
+        let mut warmup_tokens = 0usize;
+        for _ in 0..warmup_runs {
+            let mut engine = InferenceEngine::new(model, device.clone())
+                .context("Failed to initialise inference engine for warmup")?;
+            let (_text, n_tokens) = engine
+                .generate_streaming(prompt, sampling, |_| std::ops::ControlFlow::Continue(()))
+                .context("Benchmark warmup generation failed")?;
+            warmup_tokens = n_tokens;
+        }
+
+        let mut total_elapsed = 0.0_f64;
+        let mut measured_tokens = 0usize;
+
+        for _ in 0..repeat_runs {
+            let mut engine = InferenceEngine::new(model, device.clone())
+                .context("Failed to initialise inference engine for measured run")?;
+            let start = std::time::Instant::now();
+            let (_text, n_tokens) = engine
+                .generate_streaming(prompt, sampling, |_| std::ops::ControlFlow::Continue(()))
+                .context("Benchmark generation failed")?;
+            total_elapsed += start.elapsed().as_secs_f64();
+            measured_tokens = n_tokens;
+        }
+
+        let avg_elapsed = total_elapsed / repeat_runs as f64;
+        let tokens_per_sec = if avg_elapsed > 0.0 {
+            measured_tokens as f64 / avg_elapsed
+        } else {
+            0.0
+        };
+
+        Ok((warmup_tokens, avg_elapsed, tokens_per_sec))
+    }
+
+    if let Some(ref sweep) = args.thread_sweep {
+        if args.device != DeviceArg::Cpu {
+            return Err(anyhow!(
+                "--thread-sweep is only supported with --device cpu"
+            ));
+        }
+
+        let (start_threads, end_threads) = parse_thread_sweep(sweep)?;
+        eprintln!(
+            "Benchmarking CPU thread sweep {}-{} with {} warmup run(s), {} measured run(s), {} generated tokens …",
+            start_threads,
+            end_threads,
+            args.warmup_runs,
+            args.repeat_runs,
+            args.max_tokens
+        );
+
+        for thread_count in start_threads..=end_threads {
+            let device = Device::Cpu {
+                threads: Some(thread_count),
+            };
+            let (warmup_tokens, avg_elapsed, tokens_per_sec) = run_single_bench(
+                &args.model,
+                &args.prompt,
+                &sampling,
+                device,
+                args.warmup_runs,
+                args.repeat_runs,
+            )?;
+            println!(
+                "benchmark_device=cpu benchmark_threads={} warmup_tokens={} benchmark_tokens={} avg_elapsed_seconds={:.6} tok_per_sec={:.3}",
+                thread_count,
+                warmup_tokens,
+                warmup_tokens,
+                avg_elapsed,
+                tokens_per_sec
+            );
+        }
+
+        return Ok(());
+    }
+
+    let threads = if args.threads == 0 {
+        None
+    } else {
+        Some(args.threads)
+    };
+    let device = args.device.into_device(threads, args.gpu_id);
+
+    eprintln!(
+        "Benchmarking {} with {} warmup run(s), {} measured run(s), {} generated tokens …",
+        device, args.warmup_runs, args.repeat_runs, args.max_tokens
+    );
+
+    let (warmup_tokens, avg_elapsed, tokens_per_sec) = run_single_bench(
+        &args.model,
+        &args.prompt,
+        &sampling,
+        device,
+        args.warmup_runs,
+        args.repeat_runs,
+    )?;
+
+    println!(
+        "benchmark_tokens={} warmup_tokens={} avg_elapsed_seconds={:.6} tok_per_sec={:.3}",
+        warmup_tokens, warmup_tokens, avg_elapsed, tokens_per_sec
+    );
 
     Ok(())
 }
@@ -1023,6 +1302,48 @@ mod tests {
     fn cli_no_subcommand_returns_parse_error() {
         let args = Cli::try_parse_from(["bitnet"]);
         assert!(args.is_err(), "no subcommand must fail to parse");
+    }
+
+    #[test]
+    fn cli_parses_bench_required_args() {
+        let args = Cli::try_parse_from([
+            "bitnet",
+            "bench",
+            "--model",
+            "model.safetensors",
+            "--prompt",
+            "Hello",
+        ]);
+        assert!(args.is_ok(), "bench with required args must parse");
+    }
+
+    #[test]
+    fn cli_parses_bench_all_args() {
+        let args = Cli::try_parse_from([
+            "bitnet",
+            "bench",
+            "--model",
+            "model.safetensors",
+            "--prompt",
+            "Hello",
+            "--device",
+            "cpu",
+            "--threads",
+            "8",
+            "--thread-sweep",
+            "1-16",
+            "--gpu-id",
+            "1",
+            "--max-tokens",
+            "64",
+            "--warmup-runs",
+            "2",
+            "--repeat-runs",
+            "5",
+            "--seed",
+            "123",
+        ]);
+        assert!(args.is_ok(), "bench with all args must parse");
     }
 
     #[test]

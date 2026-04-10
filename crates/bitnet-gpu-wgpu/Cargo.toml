@@ -1,0 +1,18 @@
+[package]
+name = "bitnet-gpu-wgpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "wgpu implementation of the BitNet GPU backend (Vulkan/Metal/DX12/WebGPU)"
+
+[dependencies]
+bitnet-core.workspace = true
+bitnet-cpu.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
+futures.workspace = true
+pollster.workspace = true

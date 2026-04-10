@@ -1034,6 +1034,323 @@ pub fn dot_f32_bf16w_fast(weights_bf16_u16: &[u16], hidden: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// squared_relu_f32: x[i] = max(0, x[i])²  (in-place)
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated in-place squared ReLU: `x[i] = max(0, x[i])²`.
+///
+/// # Mathematical Specification
+///
+/// ```text
+/// SqReLU(x) = (max(0, x))²
+/// ```
+///
+/// # SIMD Strategy
+///
+/// Processes 8 × f32 per iteration:
+///   1. `_mm256_loadu_ps` — load 8 floats.
+///   2. `_mm256_max_ps(v, zero)` — clamp negatives to zero (ReLU).
+///   3. `_mm256_mul_ps(v, v)` — square the ReLU output.
+///   4. `_mm256_storeu_ps` — store result back in-place.
+///
+/// Scalar tail handles the remaining `len % 8` elements.
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn squared_relu_f32_avx2(x: &mut [f32]) {
+    let len = x.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let zero = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let v = _mm256_loadu_ps(x.as_ptr().add(base));
+        let relu = _mm256_max_ps(v, zero);
+        let sq = _mm256_mul_ps(relu, relu);
+        _mm256_storeu_ps(x.as_mut_ptr().add(base), sq);
+    }
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            let r = x[base + i].max(0.0);
+            x[base + i] = r * r;
+        }
+    }
+}
+
+/// In-place squared ReLU with automatic SIMD dispatch.
+///
+/// Computes `x[i] = max(0, x[i])²` for all i.
+///
+/// Uses AVX2 when available; scalar fallback otherwise.
+#[inline]
+pub fn squared_relu_f32_fast(x: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            unsafe { squared_relu_f32_avx2(x) };
+            return;
+        }
+    }
+    for v in x.iter_mut() {
+        let r = v.max(0.0);
+        *v = r * r;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sqrelu_gate_f32: out[i] = max(0, gate[i])² * up[i]
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated fused squared ReLU gate: `out[i] = max(0, gate[i])² * up[i]`.
+///
+/// # Mathematical Specification
+///
+/// ```text
+/// out[i] = SqReLU(gate[i]) × up[i]
+///        = (max(0, gate[i]))² × up[i]
+/// ```
+///
+/// # SIMD Strategy
+///
+/// Processes 8 × f32 per iteration:
+///   1. Load 8 gate values and 8 up values via `_mm256_loadu_ps`.
+///   2. `_mm256_max_ps(gate, zero)` — ReLU clamp.
+///   3. `_mm256_mul_ps(gate, gate)` — square.
+///   4. `_mm256_mul_ps(gate², up)` — element-wise multiply with up projection.
+///   5. `_mm256_storeu_ps` — store to output.
+///
+/// Scalar tail handles the remaining `len % 8` elements.
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn sqrelu_gate_f32_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+
+    let len = gate.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let zero = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let vg = _mm256_loadu_ps(gate.as_ptr().add(base));
+        let vu = _mm256_loadu_ps(up.as_ptr().add(base));
+        let relu = _mm256_max_ps(vg, zero);
+        let sq = _mm256_mul_ps(relu, relu);
+        let result = _mm256_mul_ps(sq, vu);
+        _mm256_storeu_ps(out.as_mut_ptr().add(base), result);
+    }
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            let r = gate[base + i].max(0.0);
+            out[base + i] = r * r * up[base + i];
+        }
+    }
+}
+
+/// Fused squared ReLU gate with automatic SIMD dispatch.
+///
+/// Computes `out[i] = max(0, gate[i])² * up[i]` for all i.
+///
+/// Uses AVX2 when available; scalar fallback otherwise.
+/// Primary use: FFN gating with squared ReLU activation.
+#[inline]
+pub fn sqrelu_gate_f32_fast(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            unsafe { sqrelu_gate_f32_avx2(gate, up, out) };
+            return;
+        }
+    }
+    for i in 0..gate.len() {
+        let r = gate[i].max(0.0);
+        out[i] = r * r * up[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dot_f32_i8w: f32 hidden × i8 weights → f32 (lm_head matmul, i8 storage)
+// ---------------------------------------------------------------------------
+
+/// AVX2+FMA dot product: f32 hidden × i8 weights → f32.
+///
+/// # Mathematical Specification
+///
+/// ```text
+/// result = Σ_{i=0}^{n-1}  (weights_i8[i] as f32) × hidden[i]
+/// ```
+///
+/// # SIMD Strategy
+///
+/// Processes 8 elements per iteration:
+///   1. `_mm_loadl_epi64` — load 8 × i8 (64 bits) into the low half of a 128-bit register.
+///   2. `_mm256_cvtepi8_epi32` — sign-extend i8 → i32 (8 values in 256-bit register).
+///   3. `_mm256_cvtepi32_ps` — convert i32 → f32.
+///   4. `_mm256_loadu_ps` — load 8 × f32 hidden values.
+///   5. `_mm256_fmadd_ps` — FMA: acc += weight_f32 × hidden.
+///
+/// Horizontal sum via `hsum_f32_avx2`, followed by scalar tail for remainder.
+///
+/// # Safety
+/// Caller must verify AVX2 + FMA support via `has_avx2()` and `has_fma()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_f32_i8w_avx2(weights_i8: &[i8], hidden: &[f32]) -> f32 {
+    debug_assert_eq!(weights_i8.len(), hidden.len());
+
+    let len = weights_i8.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let mut acc = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        // Load 8 × i8 weights (64 bits = low half of 128-bit register).
+        let w_i8 = _mm_loadl_epi64(weights_i8.as_ptr().add(base) as *const __m128i);
+        // Sign-extend i8 → i32: 8 values in 256-bit register.
+        let w_i32 = _mm256_cvtepi8_epi32(w_i8);
+        // Convert i32 → f32.
+        let w_f32 = _mm256_cvtepi32_ps(w_i32);
+        // Load 8 f32 hidden values.
+        let h = _mm256_loadu_ps(hidden.as_ptr().add(base));
+        // FMA: acc += w_f32 * h.
+        acc = _mm256_fmadd_ps(w_f32, h, acc);
+    }
+
+    let mut result = hsum_f32_avx2(acc);
+
+    if remainder > 0 {
+        let base = chunks * 8;
+        for i in 0..remainder {
+            result += weights_i8[base + i] as f32 * hidden[base + i];
+        }
+    }
+
+    result
+}
+
+/// i8-weight dot product with automatic SIMD dispatch.
+///
+/// Computes `Σ_i weights_i8[i] as f32 * hidden[i]`.
+///
+/// Uses AVX2+FMA when available; scalar fallback otherwise.
+/// Primary use: LM-head matmul with i8-quantized weight storage.
+#[inline]
+pub fn dot_f32_i8w_fast(weights_i8: &[i8], hidden: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() && has_fma() {
+            // Safety: AVX2+FMA availability confirmed by the checks above.
+            return unsafe { dot_f32_i8w_avx2(weights_i8, hidden) };
+        }
+    }
+    // Scalar fallback: i8 → f32 cast + multiply-accumulate.
+    let mut acc = 0.0_f32;
+    for (&w, &h) in weights_i8.iter().zip(hidden.iter()) {
+        acc += w as f32 * h;
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
+// absmax_f32: max(|x[i]|) for all i
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated absolute maximum: `max(|x[i]|)` for all i.
+///
+/// Uses `_mm256_andnot_ps` with a sign-bit mask to compute absolute value,
+/// then `_mm256_max_ps` to accumulate the maximum across 8 floats per
+/// iteration.
+///
+/// # Mathematical specification
+///
+/// `result = max_{i ∈ 0..n} |x[i]|`
+///
+/// # Safety
+/// Caller must verify AVX2 support via `has_avx2()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn absmax_f32_avx2(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = x.len();
+    if len == 0 {
+        return 0.0;
+    }
+
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    // Sign-bit mask: clears the sign bit → absolute value.
+    let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFu32 as i32));
+    let mut vmax = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let v = _mm256_loadu_ps(x.as_ptr().add(base));
+        let abs_v = _mm256_and_ps(v, sign_mask);
+        vmax = _mm256_max_ps(vmax, abs_v);
+    }
+
+    // Horizontal max of the 8-lane vector.
+    // Reduce 8 → 4 → 2 → 1.
+    let hi = _mm256_extractf128_ps(vmax, 1);
+    let lo = _mm256_castps256_ps128(vmax);
+    let max4 = _mm_max_ps(hi, lo);
+    let max4b = _mm_movehl_ps(max4, max4);
+    let max2 = _mm_max_ps(max4, max4b);
+    let max2b = _mm_shuffle_ps(max2, max2, 0x01);
+    let max1 = _mm_max_ss(max2, max2b);
+    let mut result = _mm_cvtss_f32(max1);
+
+    // Scalar tail.
+    let base = chunks * 8;
+    for i in base..base + remainder {
+        let abs_v = x[i].abs();
+        if abs_v > result {
+            result = abs_v;
+        }
+    }
+
+    result
+}
+
+/// Absolute maximum with automatic SIMD dispatch.
+///
+/// Computes `max(|x[i]|)` for all i. Returns 0.0 for empty slices.
+/// Uses AVX2 when available; scalar fallback otherwise.
+///
+/// Primary use: activation quantisation in `absmax_quantize_row_into`.
+#[inline]
+pub fn absmax_f32_fast(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // Safety: AVX2 availability confirmed by `has_avx2()`.
+            return unsafe { absmax_f32_avx2(x) };
+        }
+    }
+    // Scalar fallback.
+    x.iter().map(|v| v.abs()).fold(0.0_f32, f32::max)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1773,5 +2090,134 @@ mod tests {
             (result - n as f32).abs() < 1e-4,
             "expected {n}.0, got {result}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // squared_relu_f32
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn squared_relu_fast_basic() {
+        let mut x = vec![-2.0_f32, -1.0, 0.0, 0.5, 1.0, 2.0, 3.0, -0.5];
+        squared_relu_f32_fast(&mut x);
+        let expected = [0.0, 0.0, 0.0, 0.25, 1.0, 4.0, 9.0, 0.0];
+        for (a, b) in x.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {a}, expected {b}");
+        }
+    }
+
+    #[test]
+    fn squared_relu_fast_large() {
+        let mut x: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) / 100.0).collect();
+        let mut reference = x.clone();
+        // Reference scalar
+        for v in reference.iter_mut() {
+            let r = v.max(0.0);
+            *v = r * r;
+        }
+        squared_relu_f32_fast(&mut x);
+        for (i, (a, b)) in x.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "mismatch at {i}: got {a}, expected {b}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // sqrelu_gate_f32
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sqrelu_gate_fast_basic() {
+        let gate = vec![2.0_f32, -1.0, 3.0, 0.0];
+        let up = vec![0.5, 2.0, 1.0, 5.0];
+        let mut out = vec![0.0_f32; 4];
+        sqrelu_gate_f32_fast(&gate, &up, &mut out);
+        // sqrelu(2)=4, sqrelu(-1)=0, sqrelu(3)=9, sqrelu(0)=0
+        let expected = [4.0 * 0.5, 0.0 * 2.0, 9.0 * 1.0, 0.0 * 5.0];
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {a}, expected {b}");
+        }
+    }
+
+    #[test]
+    fn sqrelu_gate_fast_large_matches_scalar() {
+        let n = 6912; // FFN intermediate size
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - 3456.0) / 1000.0).collect();
+        let up: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut out_fast = vec![0.0_f32; n];
+        let mut out_ref = vec![0.0_f32; n];
+        sqrelu_gate_f32_fast(&gate, &up, &mut out_fast);
+        for i in 0..n {
+            let r = gate[i].max(0.0);
+            out_ref[i] = r * r * up[i];
+        }
+        for (i, (a, b)) in out_fast.iter().zip(out_ref.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "mismatch at {i}: got {a}, expected {b}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dot_f32_i8w
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dot_f32_i8w_basic() {
+        let weights: Vec<i8> = vec![1, -1, 2, -2, 0, 3, -3, 1];
+        let hidden: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let result = dot_f32_i8w_fast(&weights, &hidden);
+        // 1*1 + (-1)*2 + 2*3 + (-2)*4 + 0*5 + 3*6 + (-3)*7 + 1*8
+        // = 1 - 2 + 6 - 8 + 0 + 18 - 21 + 8 = 2.0
+        assert!((result - 2.0).abs() < 1e-5, "got {result}");
+    }
+
+    #[test]
+    fn dot_f32_i8w_large_matches_scalar() {
+        let n = 2560;
+        let weights: Vec<i8> = (0..n)
+            .map(|i| ((i % 256) as i8).wrapping_add(i as i8))
+            .collect();
+        let hidden: Vec<f32> = (0..n).map(|i| (i as f32 * 0.001).sin()).collect();
+        let fast = dot_f32_i8w_fast(&weights, &hidden);
+        let scalar: f32 = weights
+            .iter()
+            .zip(hidden.iter())
+            .map(|(&w, &h)| w as f32 * h)
+            .sum();
+        assert!((fast - scalar).abs() < 1e-1, "fast={fast}, scalar={scalar}");
+    }
+
+    #[test]
+    fn absmax_f32_fast_basic() {
+        let x = vec![-3.0_f32, 1.0, -5.0, 2.0, 4.0];
+        let result = absmax_f32_fast(&x);
+        assert!((result - 5.0).abs() < 1e-6, "expected 5.0, got {result}");
+    }
+
+    #[test]
+    fn absmax_f32_fast_all_positive() {
+        let x: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+        let result = absmax_f32_fast(&x);
+        assert!((result - 16.0).abs() < 1e-6, "expected 16.0, got {result}");
+    }
+
+    #[test]
+    fn absmax_f32_fast_empty_returns_zero() {
+        let x: Vec<f32> = vec![];
+        let result = absmax_f32_fast(&x);
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn absmax_f32_fast_matches_scalar_large() {
+        let n = 2560;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 1280.0) / 50.0).collect();
+        let fast = absmax_f32_fast(&x);
+        let scalar = x.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        assert!((fast - scalar).abs() < 1e-4, "fast={fast}, scalar={scalar}");
     }
 }

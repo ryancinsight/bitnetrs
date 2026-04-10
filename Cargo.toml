@@ -3,6 +3,8 @@ members = [
     "crates/bitnet-core",
     "crates/bitnet-cpu",
     "crates/bitnet-gpu",
+    "crates/bitnet-gpu-wgpu",
+    "crates/bitnet-gpu-cuda",
     "crates/bitnet-npu",
     "crates/bitnet-weights",
     "crates/bitnet-convert",
@@ -72,6 +74,8 @@ tempfile = "3"
 bitnet-core      = { path = "crates/bitnet-core" }
 bitnet-cpu       = { path = "crates/bitnet-cpu" }
 bitnet-gpu       = { path = "crates/bitnet-gpu" }
+bitnet-gpu-wgpu  = { path = "crates/bitnet-gpu-wgpu" }
+bitnet-gpu-cuda  = { path = "crates/bitnet-gpu-cuda" }
 bitnet-npu       = { path = "crates/bitnet-npu" }
 bitnet-weights   = { path = "crates/bitnet-weights" }
 bitnet-tokenizer = { path = "crates/bitnet-tokenizer" }
