@@ -48,6 +48,18 @@ Each gap is classified by:
 | G20 | KVCache does not enforce max_seq overflow at store_kv | High | S | Closed |
 | G21 | Missing activation quantisation (absmax i8) in forward pass | Critical | M | Closed |
 | G22 | CPU inference parallelisation and allocation overhead | Medium | M | Closed |
+| G23 | 2-bit packed weight storage (4× bandwidth reduction) | High | M | Closed |
+| G24 | Packed SIMD kernels (dot_packed_ternary, dot_f32_f32_avx2) | Medium | M | Closed |
+| G25 | Sampling allocation elimination (SamplingBuffers) | Medium | S | Closed |
+| G26 | Attention score pre-allocation (thread-local RefCell) | Medium | S | Closed |
+| G27 | lm_head scratch buffer (lm_head_matmul_into) | Medium | S | Closed |
+| G28 | Backend trait packed weight support (&[u8] packed GEMV) | Medium | M | Closed |
+| G29 | GPU compute shader for packed 2-bit weights | Medium | M | Open |
+| G30 | SSE4.1/NEON fallback for packed dot products | Low | M | Open |
+| G31 | AVX2 lm_head via Backend trait extension | Medium | M | Open |
+| G32 | Fully fused packed SIMD kernel (inline decode + dot) | Low | M | Open |
+| G33 | f16/bf16 embedding table for lm_head bandwidth | Medium | M | Open |
+| G34 | CI regression harness for tokens/sec | Low | S | Open |
 
 ---
 
@@ -572,34 +584,250 @@ Several CPU-bound operations in the forward pass were sequential or incurred per
 
 ---
 
+### G23 — 2-Bit Packed Weight Storage
+
+**Severity:** High  
+**Effort:** M  
+**Status:** Closed
+
+**Description:**  
+`TernaryWeight.data` stored values as `Vec<i8>` (1 byte per ternary value). Since ternary values occupy only 2 bits ({−1, 0, +1} mapped to {0b00, 0b01, 0b10}), packing 4 values per byte reduces memory bandwidth by 4× for ternary GEMV.
+
+**Impact:**  
+- 4× reduction in memory bandwidth for all ternary projections (Q/K/V/O/gate/up/down per layer × 30 layers).
+- Theoretical ~2× tok/s improvement for bandwidth-bound CPU inference.
+
+**Resolution (commit f8fd086):**  
+1. `TernaryWeight.data` changed from `Vec<i8>` to `Vec<u8>` (2-bit packed, 4 values per byte).
+2. Row-aligned packing with LUT-based decode.
+3. All 13 affected crate files updated atomically.
+4. 677 tests pass, 0 failures.
+
+---
+
+### G24 — Packed SIMD Kernels
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Closed
+
+**Description:**  
+The existing AVX2 SIMD kernel (`dot_ternary_avx2`) operated on unpacked `i8` weights. With the 2-bit packed storage (G23), new SIMD kernels are required that decode packed bytes and compute dot products in a single pass.
+
+**Resolution (commit f8fd086):**  
+1. `dot_packed_ternary_i8_fast` — packed 2-bit decode + i8 dot product.
+2. `dot_packed_ternary_f32_fast` — packed 2-bit decode + f32 dot product.
+3. `dot_f32_f32_avx2` — AVX2+FMA f32 dot product for `lm_head` (replaces auto-vectorised baseline).
+4. FMA runtime detection added via `is_x86_feature_detected!`.
+
+---
+
+### G25 — Sampling Allocation Elimination
+
+**Severity:** Medium  
+**Effort:** S  
+**Status:** Closed
+
+**Description:**  
+`sample_next_token` allocated 2–3 MiB per token call: a `Vec<f32>` logit clone for sorting, a `HashSet<usize>` for top-p tracking, and softmax temporaries. At ~10 tok/s this produced ~30 MiB/s of short-lived heap churn.
+
+**Resolution (commit f8fd086):**  
+1. `SamplingBuffers` struct holds reusable `Vec` allocations across token steps.
+2. Top-k uses `select_nth_unstable_by` (O(V) average vs O(V log V) sort).
+3. Top-p uses a flag array (`Vec<bool>`) instead of `HashSet`.
+4. Single softmax pass over the filtered logit set.
+
+---
+
+### G26 — Attention Score Pre-Allocation
+
+**Severity:** Medium  
+**Effort:** S  
+**Status:** Closed
+
+**Description:**  
+`masked_attention` allocated a fresh `Vec<f32>` for attention scores on every call. At 20 heads × 30 layers per token, this produced 600 allocations/token (~320 KiB/call at max sequence length).
+
+**Resolution (commit f8fd086):**  
+Thread-local reusable score buffer via `RefCell`. Each thread in the Rayon pool retains its score vector across calls, resizing only when sequence length grows. Eliminates 320 KiB/call heap churn.
+
+---
+
+### G27 — lm_head Scratch Buffer
+
+**Severity:** Medium  
+**Effort:** S  
+**Status:** Closed
+
+**Description:**  
+`lm_head_matmul` returned a freshly allocated `Vec<f32>` of 128,256 logits per token. The caller discarded the previous buffer each step, creating ~512 KiB/token of allocation pressure.
+
+**Resolution (commit f8fd086):**  
+1. `lm_head_matmul_into` writes directly to a pre-allocated buffer.
+2. Logits buffer integrated into `ScratchBuffers` struct, allocated once at model init.
+
+---
+
+### G28 — Backend Trait Packed Weight Support
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Closed
+
+**Description:**  
+The `Backend::ternary_gemv` signature accepted `&[i8]` (unpacked). With 2-bit packed storage (G23), all backends must accept `&[u8]` packed weight data.
+
+**Resolution (commit f8fd086):**  
+1. `Backend::ternary_gemv` signature changed to accept `&[u8]` packed weights.
+2. `CpuBackend`: dispatches to packed SIMD kernels (G24).
+3. `GpuBackend`: falls back to CPU (WGSL shader not yet updated for packed format; see G29).
+4. `NpuBackend`: delegates to inner backend (transparent).
+
+---
+
+### G29 — GPU Compute Shader for Packed 2-Bit Weights
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+`gemv.wgsl` still expects unpacked `i32`-encoded ternary weights. With the packed 2-bit storage format (G23), the shader must decode 4 values per byte within the workgroup.
+
+**Impact:**  
+- GPU `ternary_gemv` currently falls back to CPU, negating GPU acceleration for ternary projections.
+- Blocked by G23 (now closed); unblocked for implementation.
+
+**Proposed Fix:**  
+1. Rewrite `gemv.wgsl` to read `u8` packed weights from a storage buffer.
+2. Decode 4 ternary values per byte using bitwise ops in WGSL.
+3. Update `GpuBackend::dispatch_gemv` to upload `&[u8]` packed data.
+4. Validate numerical equivalence against CPU packed kernels.
+
+---
+
+### G30 — SSE4.1/NEON Fallback for Packed Dot Products
+
+**Severity:** Low  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+The packed SIMD kernels (G24) require AVX2+FMA. Pre-Haswell x86 CPUs and all ARM64 targets fall back to scalar decode + dot product.
+
+**Impact:**  
+- ARM64 (Apple Silicon, Graviton) gets no SIMD benefit from packed weights.
+- Pre-2013 x86 CPUs fall back to scalar.
+
+**Proposed Fix:**  
+1. `dot_packed_ternary_neon` — NEON 128-bit decode + `VMLA` accumulation.
+2. `dot_packed_ternary_sse41` — SSE4.1 fallback for older x86.
+3. Runtime dispatch chain: AVX2 → SSE4.1 → scalar.
+
+---
+
+### G31 — AVX2 lm_head via Backend Trait Extension
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+`lm_head_matmul_into` in `bitnet-core` computes f32×f32 dot products for 128,256 vocab rows. It cannot call `dot_f32_f32_avx2` from `bitnet-cpu` due to DIP (parent modules define abstractions; child modules provide implementations). The `lm_head` operation is not part of the `Backend` trait.
+
+**Impact:**  
+- `lm_head` remains auto-vectorised, not explicitly SIMD-accelerated.
+- `lm_head` is the dominant remaining bottleneck (~1.31 GB f32 weight matrix).
+
+**Proposed Fix:**  
+1. Add `lm_head_matmul_into` to the `Backend` trait.
+2. `CpuBackend` implementation dispatches to `dot_f32_f32_avx2` per row.
+3. `GpuBackend` can later dispatch to a GPU shader for this operation.
+4. Preserves DIP: `bitnet-core` defines the abstraction, `bitnet-cpu` provides the implementation.
+
+---
+
+### G32 — Fully Fused Packed SIMD Kernel
+
+**Severity:** Low  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+Current packed SIMD kernels decode packed bytes to an intermediate buffer, then compute the dot product. A fully fused kernel would inline the 2-bit decode within the SIMD loop body, avoiding the intermediate buffer entirely.
+
+**Impact:**  
+- Eliminates one pass over the weight data per dot product.
+- Potential 10–20% additional speedup for ternary GEMV.
+
+**Proposed Fix:**  
+Single-pass AVX2 kernel: load packed `u8` → shift/mask to extract 4 ternary values → sign-extend to i16 → `VPMADDWD` with activation → horizontal accumulate. No intermediate buffer.
+
+---
+
+### G33 — f16/bf16 Embedding Table for lm_head Bandwidth
+
+**Severity:** Medium  
+**Effort:** M  
+**Status:** Open
+
+**Description:**  
+The `embed_tokens` / `lm_head` weight matrix is stored as `Vec<f32>` (~1.31 GB for 128,256 × 2560). Since `lm_head` is the dominant remaining bottleneck, halving its bandwidth via f16 storage reduces per-token latency.
+
+**Impact:**  
+- ~2× bandwidth reduction for `lm_head` (650 MB f16 vs 1.31 GB f32).
+- Requires f16→f32 conversion during dot product (negligible compute cost with FMA).
+
+**Proposed Fix:**  
+1. Store `embed_tokens` as `Vec<half::f16>` or `Vec<half::bf16>`.
+2. `lm_head_matmul_into` reads f16 and widens to f32 during accumulation.
+3. AVX2 kernel: `VCVTPH2PS` for f16→f32 conversion (requires F16C, available on all AVX2 CPUs).
+
+---
+
+### G34 — CI Regression Harness for Tokens/Sec
+
+**Severity:** Low  
+**Effort:** S  
+**Status:** Open
+
+**Description:**  
+No automated regression tracking for inference throughput. Performance regressions can be introduced silently.
+
+**Proposed Fix:**  
+1. Criterion benchmark: prefill + decode loop on a small synthetic model.
+2. CI job records tok/s per commit.
+3. Alert threshold: >10% regression from baseline.
+
+---
+
 ## Risk Matrix
 
 ```
                     EFFORT
-              S      M      L     XL
-         ┌──────┬──────┬──────┬──────┐
-C        │      │ G06* │      │      │
-R  High  │      │      │      │      │
-I        │      │ G09  │  G02 │      │
-T        │      │ G01  │  G04 │      │
-I        ├──────┼──────┼──────┼──────┤
-C  Med   │  G13 │  G03 │  G05 │ G11  │
-A        │  G19 │  G12 │      │      │
-L        │      │      │  G14 │      │
-         ├──────┼──────┼──────┼──────┤
-   Low   │      │      │  G16 │      │
-         │      │      │      │      │
-         └──────┴──────┴──────┴──────┘
+              S       M          L      XL
+         ┌───────┬──────────┬───────┬───────┐
+C        │       │   G06*   │       │       │
+R  High  │       │ G01 G09  │  G02  │       │
+I        │       │          │  G04  │       │
+T        ├───────┼──────────┼───────┼───────┤
+I  Med   │  G13  │ G03  G12 │       │  G11  │
+C        │  G31  │ G29  G33 │       │       │
+A        ├───────┼──────────┼───────┼───────┤
+L  Low   │  G19  │ G30  G32 │  G14  │       │
+         │  G34  │          │  G16  │       │
+         └───────┴──────────┴───────┴───────┘
+```
 
 * G06 is **Partial** — tiny-model regression tests pass; real-weights `output.contains("Paris")` test now passes; additional diverse-prompt end-to-end tests remain.
-Closed this sprint (removed from matrix): G07, G08, G10, G17, G18, G20, G21.
+Closed (removed from matrix): G05, G07, G08, G10, G17, G18, G20, G21, G22, G23, G24, G25, G26, G27, G28.
 ```
 
 ---
 
 ## Recommended Sprint Priorities
 
-### Sprint 1 (Critical / Quick Wins) — ✅ Mostly Closed
+### Sprint 1 (Critical / Quick Wins) — ✅ Closed
 1. **G20** ✅ — KVCache max_seq overflow check (S, High) — **Closed**
 2. **G06** 🔶 — Golden output regression tests (M, Critical) — **Partial** (tiny-model tests pass; end-to-end against real 2B weights pending)
 3. **G08** ✅ — Auto-detect model config from config.json (S, Medium) — **Closed**
@@ -607,22 +835,38 @@ Closed this sprint (removed from matrix): G07, G08, G10, G17, G18, G20, G21.
 
 *Additional Sprint 1 closures:* **G07** ✅ (Samsung/MediaTek NPU detection, `BITNET_NPU_ADAPTER` env var), **G10** ✅ (`Arc<Vec<f32>>` weight tying, −1.3 GB allocation), **G17** ✅ (`decode_with_special_tokens`).
 
-### Sprint 2 (Active — High Severity / Medium Effort)
-1. **G21** ✅ — Weight-scale dequantization fix in `decode_packed_projection` (M, Critical) — **Done** (`.recip()` removed; `output.contains("Paris")` verified)
+### Sprint 2 (Correctness — High Severity / Medium Effort) — ✅ Mostly Closed
+1. **G21** ✅ — Weight-scale dequantization fix in `decode_packed_projection` (M, Critical) — **Closed** (`.recip()` removed; `output.contains("Paris")` verified)
 2. **G01** — Exact LLaMA 3 tokenizer from tokenizer.json (M, High)
 3. **G09** — Verify GQA cache layout with golden tests (M, High)
 4. **G03** — Streaming token output (M, Medium)
 5. **G06** 🔶 — Complete end-to-end golden output tests against real 2B weights (M, Critical)
 
-### Sprint 3 (Performance) — ✅ CPU Closed; GPU Open
-1. **G02** — Persistent GPU buffers (L, High) — **Open**
-2. **G05** ✅ — SIMD CPU GEMV intrinsics (L, Medium) — **Closed** (AVX2 `VPSIGNW`+`VPMADDWD` in `simd.rs`, 10.2–10.4 tok/s)
-3. **G22** ✅ — CPU parallelisation + allocation elimination (M, Medium) — **Closed** (Rayon lm_head/attention, persistent scratch buffers)
+### Sprint 3 (Phase 2 Performance) — ✅ CPU Closed; GPU Open
+1. **G05** ✅ — SIMD CPU GEMV intrinsics (L, Medium) — **Closed** (AVX2 `VPSIGNW`+`VPMADDWD` in `simd.rs`, 10.2–10.4 tok/s)
+2. **G22** ✅ — CPU parallelisation + allocation elimination (M, Medium) — **Closed** (Rayon lm_head/attention, persistent scratch buffers)
+3. **G23** ✅ — 2-bit packed weight storage (M, High) — **Closed** (`Vec<i8>` → `Vec<u8>` packed 2-bit, 4× bandwidth reduction, 677 tests pass)
+4. **G24** ✅ — Packed SIMD kernels (M, Medium) — **Closed** (`dot_packed_ternary_i8_fast`, `dot_packed_ternary_f32_fast`, `dot_f32_f32_avx2` + FMA detection)
+5. **G25** ✅ — Sampling allocation elimination (S, Medium) — **Closed** (`SamplingBuffers`, O(V) top-k, flag-array top-p)
+6. **G26** ✅ — Attention score pre-allocation (S, Medium) — **Closed** (thread-local `RefCell` score buffer)
+7. **G27** ✅ — lm_head scratch buffer (S, Medium) — **Closed** (`lm_head_matmul_into` + `ScratchBuffers` logits buffer)
+8. **G28** ✅ — Backend trait packed weights (M, Medium) — **Closed** (`ternary_gemv` now takes `&[u8]`; GPU falls back to CPU pending G29)
+9. **G02** — Persistent GPU buffers (L, High) — **Open**
+10. **G29** — GPU compute shader for packed 2-bit weights (M, Medium) — **Open** (`gemv.wgsl` rewrite needed)
+
+*Performance projection:* Previous ~10.2–10.4 tok/s → theoretical ~20 tok/s target (4× ternary bandwidth reduction). Main remaining bottleneck: `lm_head` (1.31 GB f32 weights, unchanged).
 
 ### Sprint 4 (Features / Polish)
 1. **G12** — Multiple model variant support (M, Medium)
 2. **G13** — Dynamic GPU attention sequence length (S, Medium)
 3. **G16** — HTTP server mode (L, Low)
+
+### Sprint 5 (Next Performance — lm_head + Portability)
+1. **G31** — AVX2 lm_head via Backend trait extension (M, Medium) — add `lm_head_matmul_into` to `Backend` so `CpuBackend` can use `dot_f32_f32_avx2`
+2. **G33** — f16/bf16 embedding table (M, Medium) — halve lm_head bandwidth (~650 MB f16 vs 1.31 GB f32)
+3. **G32** — Fully fused packed SIMD kernel (M, Low) — inline decode + dot product, eliminate intermediate buffer
+4. **G30** — SSE4.1/NEON fallback (M, Low) — ARM64 + pre-Haswell x86 packed dot products
+5. **G34** — CI regression harness for tokens/sec (S, Low)
 
 ---
 
@@ -638,4 +882,4 @@ A gap is considered **closed** when:
 
 ---
 
-*Last updated: 2025-07 by Ryan Clanton*
+*Last updated: 2025-07 by Ryan Clanton — Phase 2 performance optimizations (commit f8fd086): G23–G28 closed*

@@ -225,10 +225,20 @@ Complete, production-quality Rust reimplementation of Microsoft's BitNet b1.58 (
 
 | ID | Story | Priority | Status |
 |----|-------|----------|--------|
-| FP-1 | 2-bit packed weight storage (4× less memory bandwidth, ~2× speedup potential) | P1 | — |
-| FP-2 | SSE4.1 fallback SIMD path for pre-AVX2 CPUs | P2 | — |
+| FP-1 | 2-bit packed weight storage — `TernaryWeight.data` changed to `Vec<u8>` (packed 2-bit, 4 per byte); row-aligned packing, LUT-based decode; 4× memory bandwidth reduction for ternary GEMV; 13 crate files updated atomically (commit f8fd086) | P1 | ✅ Done |
+| FP-2 | SSE4.1/NEON fallback SIMD paths for packed dot products on pre-AVX2 / ARM64 CPUs | P2 | — |
 | FP-3 | GPU inference via wgpu compute shaders (persistent buffers, see G02) | P0 | — |
 | FP-4 | KV cache quantisation (fp16 or int8) | P2 | — |
+| FP-5 | Packed SIMD kernels — `dot_packed_ternary_i8_fast`, `dot_packed_ternary_f32_fast`, `dot_f32_f32_avx2` (AVX2+FMA f32 dot for lm_head); FMA runtime detection (commit f8fd086) | P1 | ✅ Done |
+| FP-6 | Sampling optimization — `SamplingBuffers` struct eliminates 2–3 MiB/token allocation; `select_nth_unstable_by` O(V) avg top-k; flag-array top-p (no HashSet); single softmax pass (commit f8fd086) | P1 | ✅ Done |
+| FP-7 | Attention score pre-allocation — thread-local reusable score buffer via `RefCell`; eliminates 320 KiB/call heap churn (commit f8fd086) | P1 | ✅ Done |
+| FP-8 | lm_head scratch buffer — `lm_head_matmul_into` writes to pre-allocated buffer; logits buffer in `ScratchBuffers` (commit f8fd086) | P1 | ✅ Done |
+| FP-9 | Backend trait packed weights — all backends updated: `ternary_gemv` now takes `&[u8]` packed; GPU GEMV falls back to CPU (shader not yet updated) (commit f8fd086) | P0 | ✅ Done |
+| FP-10 | GPU compute shader update for packed 2-bit weights (`gemv.wgsl` rewrite for `&[u8]` packed input) | P0 | — |
+| FP-11 | AVX2 SIMD for lm_head — add `lm_head` to `Backend` trait so `CpuBackend` can use its SIMD kernels (DIP-compliant; currently auto-vectorised because `bitnet-core` cannot call `bitnet-cpu` SIMD) | P1 | — |
+| FP-12 | Fully fused packed SIMD kernel — inline decode + dot product without intermediate buffer | P1 | — |
+| FP-13 | f16/bf16 embedding table to reduce lm_head bandwidth (1.31 GB f32 → ~655 MB f16) | P1 | — |
+| FP-14 | CI regression harness for tokens/sec (automated performance tracking) | P1 | — |
 
 ---
 

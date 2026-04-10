@@ -61,8 +61,8 @@
 ### Quantisation (`quant/`)
 
 #### Ternary (`quant/ternary.rs`)
-- ✅ `TernaryWeight { data, scale, rows, cols }` struct
-- ✅ `TernaryWeight::new()` — validates shape, scale > 0, ternary values (debug)
+- ✅ `TernaryWeight { data: Vec<u8>, scale, rows, cols }` struct — 2-bit packed storage (4 weights/byte), row-aligned, LUT-based decode
+- ✅ `TernaryWeight::new()` — validates shape, scale > 0, packed data length
 - ✅ `TernaryWeight::new_unchecked()`
 - ✅ `TernaryWeight::row()`, `get()`, `numel()`, `pack()`, `packed_bytes()`
 - ✅ `pack_ternary()` — 2-bit/value, little-endian bit packing
@@ -87,7 +87,7 @@
 - ✅ Tests: max element → 127, negative max → -127, all-zero, roundtrip, i8 range, end-to-end pipeline
 
 ### Backend Abstraction (`backend/`)
-- ✅ `Backend` trait with 8 methods
+- ✅ `Backend` trait with 8 methods — `ternary_gemv` accepts `&[u8]` packed 2-bit weights
 - ✅ `Device` enum: Cpu/Gpu/Npu with fields
 - ✅ `Device` Display, Default, convenience constructors
 - ✅ Blanket `impl Backend for Arc<dyn Backend>`
@@ -105,19 +105,26 @@
 ## Phase 3 — `bitnet-cpu`
 
 ### GEMV (`gemv.rs`)
-- ✅ `ternary_gemv_f32()` — Rayon parallel outer loop
-- ✅ `dot_ternary_f32()` — single-row inner kernel
-- ✅ `dot_ternary_i8()` — integer accumulator variant
+- ✅ `ternary_gemv_f32()` — Rayon parallel outer loop, accepts `&[u8]` packed 2-bit weights
+- ✅ `dot_ternary_f32()` — single-row inner kernel (unpacked i8)
+- ✅ `dot_ternary_i8()` — integer accumulator variant (unpacked i8)
+- ✅ `dot_packed_ternary_i8_fast()` — packed 2-bit decode + i8 dot product
+- ✅ `dot_packed_ternary_f32_fast()` — packed 2-bit decode + f32 dot product
 - ✅ `ternary_gemv_quantised()` — W_q·x_q with combined scale
 - ✅ Shape validation before dispatch
-- ✅ Tests: 2×3 matrix, identity, negation, scale linearity, zero input, error cases, quantised vs f32 consistency
+- ✅ Tests: 2×3 matrix, identity, negation, scale linearity, zero input, error cases, quantised vs f32 consistency, packed weight variants
 
 ### SIMD (`simd.rs`)
 - ✅ `dot_ternary_avx2()` — AVX2-accelerated ternary dot product (`VPSIGNW` + `VPMADDWD`, i16 precision)
+- ✅ `dot_packed_ternary_i8_fast()` — packed 2-bit SIMD decode + i8 accumulator for ternary GEMV
+- ✅ `dot_packed_ternary_f32_fast()` — packed 2-bit SIMD decode + f32 accumulator for ternary GEMV
+- ✅ `dot_f32_f32_avx2()` — AVX2+FMA f32 dot product for lm_head matmul
 - ✅ `has_avx2()` — runtime CPUID detection for automatic dispatch
+- ✅ `has_fma()` — runtime FMA detection for `dot_f32_f32_avx2`
 - ✅ Correct for all inputs including the −128 edge case (i16 accumulation avoids i8 overflow)
 - ✅ Processes 16 elements per AVX2 iteration vs 1 element scalar
-- ✅ Measured: 10.2–10.4 tok/s on CPU (from ~2–3 tok/s pre-optimisation)
+- ✅ 4× memory bandwidth reduction via 2-bit packed weight decode in SIMD kernels
+- ✅ Phase 1 baseline: 10.2–10.4 tok/s; Phase 2 target: ~20 tok/s (4× ternary BW reduction)
 
 ### Normalisation (`norm.rs`)
 - ✅ `rms_norm()` — checked variant
@@ -141,6 +148,7 @@
 - ✅ Numerically stable softmax over scores
 - ✅ Output as convex combination of V vectors
 - ✅ Rayon-parallel attention heads (20 heads via `par_chunks_mut`)
+- ✅ Thread-local reusable score buffer via `RefCell` — eliminates 320 KiB/call heap churn (G09-ATTN-ALLOC)
 - ✅ Tests: single-position identity, uniform scores → averaged values, dominant score, GQA head assignment, convex combination property, finite outputs, error cases, scale linearity, softmax shift invariance, 2B model dimensions smoke test
 
 ### Activation (`activation.rs`)
@@ -154,7 +162,7 @@
 ### CpuBackend (`lib.rs`)
 - ✅ `CpuBackend::new(threads)` — Rayon pool initialisation
 - ✅ `CpuBackend::into_arc()`
-- ✅ `impl Backend for CpuBackend` — all 8 methods
+- ✅ `impl Backend for CpuBackend` — all 8 methods; `ternary_gemv` accepts `&[u8]` packed 2-bit weights
 - ✅ `#[instrument]` tracing on all Backend methods
 - ✅ Tests: all Backend methods via factory, Arc forwarding, mini-transformer-block smoke test
 
@@ -203,7 +211,7 @@
 - ✅ `GpuBackend::new_blocking()` — pollster wrapper
 - ✅ `GpuBackend::into_arc()`
 - ✅ `dispatch_gemv()`, `dispatch_rms_norm()`, `dispatch_rope()`, `dispatch_attention()`
-- ✅ `impl Backend for GpuBackend` — all methods with CPU fallback on GPU error
+- ✅ `impl Backend for GpuBackend` — all methods with CPU fallback on GPU error; GEMV falls back to CPU (shader not yet updated for packed 2-bit weights)
 - ✅ `#[instrument]` tracing on all Backend methods
 - ✅ Pod parameter structs: GemvParams, NormParams, RopeParams, AttnParams
 - ✅ Tests: init, wrong shape errors, position-0 RoPE identity, single-position attention, all device-skip-if-no-GPU pattern
@@ -330,6 +338,7 @@
 - ✅ Scratch buffer reuse across layers
 - ✅ Persistent model scratch buffers (`ScratchBuffers` struct, allocated once at model init)
 - ✅ Rayon-parallel `lm_head_matmul` (128K vocab rows via `par_chunks`)
+- ✅ `lm_head_matmul_into()` — writes to pre-allocated logits buffer in `ScratchBuffers` (G10-LMHEAD-SCRATCH)
 - ✅ Pre-allocated activation quantisation buffer (`absmax_quantize_row_into`)
 - ✅ KV cache position advancement
 - ✅ Tests: single token logit count, finite logits, empty tokens error, exceeds max_pos error, exceeds kv_cache max_seq error, kv_cache advances, autoregressive decode step, new_kv_cache dimensions
@@ -347,6 +356,10 @@
 - ✅ `SamplingConfig::greedy()`, `chat_defaults()`, `creative()`
 - ✅ `SamplingConfig::validate()`
 - ✅ `sample_next_token()` — full pipeline: penalty → temp → top-k → top-p → softmax → LCG sample
+- ✅ `SamplingBuffers` struct — pre-allocated logits/indices/flags buffers, eliminates 2–3 MiB/token allocation (G08-SAMPLING-OPT)
+- ✅ Top-k via `select_nth_unstable_by` — O(V) average vs O(V log V) full sort
+- ✅ Top-p via flag array instead of `HashSet` — cache-friendly, zero per-token allocation
+- ✅ Single softmax pass over filtered candidates
 - ✅ LCG PRNG: Knuth TAOCP constants, seeded from config.seed + past_tokens.len()
 - ✅ Greedy shortcut (top_k=1 → argmax)
 - ✅ Tests: greedy picks argmax, token in valid range, repetition penalty, determinism, different seeds may differ, all-neg-infinity except one, top-k constraint, temp near zero → greedy, sampling stress test (100 steps no panic), top-k correctness theorem test
@@ -443,7 +456,10 @@
 ## Known Limitations (see gap_audit.md)
 
 - GPU backend allocates/uploads buffers per forward call (not persistent)
-- ~~No SIMD intrinsics for CPU GEMV (relies on auto-vectorisation)~~ **Resolved**: AVX2-accelerated ternary dot product in `bitnet-cpu/src/simd.rs` via `VPSIGNW`+`VPMADDWD`; runtime CPUID dispatch; 10.2–10.4 tok/s (see G05 in gap_audit.md)
+- GPU GEMV shader (`gemv.wgsl`) not yet updated for packed 2-bit weights — falls back to CPU (see G29 in gap_audit.md)
+- ~~No SIMD intrinsics for CPU GEMV (relies on auto-vectorisation)~~ **Resolved**: AVX2-accelerated ternary dot product in `bitnet-cpu/src/simd.rs` via `VPSIGNW`+`VPMADDWD`; runtime CPUID dispatch; 10.2–10.4 tok/s (see G05 in gap_audit.md). **Phase 2** (commit f8fd086): packed 2-bit SIMD kernels, sampling buffers, attention pre-alloc, lm_head scratch — 4× ternary bandwidth reduction; ~20 tok/s theoretical target
+- lm_head remains the primary bottleneck: 1.31 GB f32 weights, no SIMD from `bitnet-cpu` due to DIP boundary (solution: add `lm_head` to `Backend` trait so `CpuBackend` can use its SIMD kernels; see G31 in gap_audit.md)
+- No SSE4.1/NEON fallback for packed dot products — AVX2-only (see G30 in gap_audit.md)
 - Tokenizer uses cl100k_base, not exact LLaMA 3 BPE vocab
 - No streaming token output (waits for full generation)
 - Single-batch inference only (no batched prefill)
